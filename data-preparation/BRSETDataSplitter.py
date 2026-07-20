@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import pandas as pd
+from PIL import Image
 
 class BRSETDataSplitter:
     def __init__(self,
@@ -142,9 +143,16 @@ class BRSETDataSplitter:
         
         print(f"Eligible cohort size after user filters: {len(self.df)} images from {self.df['patient_id'].nunique()} patients.")
 
-
+    # Verify that every remaining image in the cohort exists and is decodable
     def _verify_cohort_images(self):
-        pass
+        for image_path in self.df["image_path"]:
+            # Check for existence
+            if not image_path.is_file():
+                raise FileNotFoundError(f"Image file not found: {image_path}")
+            
+            # Check for decodability
+            with Image.open(image_path) as image:
+                image.verify()
     
     def _generate_splits(self):
         pass
