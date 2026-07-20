@@ -16,7 +16,7 @@ try:
 except ImportError:
     wandb = None
 
-# --- MODULAR IMPORTS (Based on CA-MLC-REFACTOR layout) ---
+# --- MODULAR IMPORTS ---
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
 from gnn.patientgraphmodel import PatientGraphModel, DemographicSpec
 
@@ -49,7 +49,6 @@ DEFAULT_DEMOGRAPHIC_CANDIDATES = [
 
 NUMERIC_HINTS = ("age", "time", "years", "duration", "count", "score", "num")
 
-
 def infer_label_columns(frame: pd.DataFrame, requested: Optional[List[str]]) -> List[str]:
     if requested:
         return requested
@@ -57,7 +56,6 @@ def infer_label_columns(frame: pd.DataFrame, requested: Optional[List[str]]) -> 
         if all(col in frame.columns for col in candidate):
             return candidate
     raise ValueError("Could not infer label columns. Pass --label-columns explicitly.")
-
 
 def infer_demographic_columns(frame: pd.DataFrame, requested: Optional[List[str]], label_columns: Sequence[str]) -> List[str]:
     if requested:
@@ -67,7 +65,6 @@ def infer_demographic_columns(frame: pd.DataFrame, requested: Optional[List[str]
     if candidates:
         return candidates
     raise ValueError("No demographic columns found. Pass --demographic-columns explicitly.")
-
 
 def fit_demographic_specs(frame: pd.DataFrame, demographic_columns: Sequence[str]) -> List[DemographicSpec]:
     specs: List[DemographicSpec] = []
@@ -98,8 +95,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Tune GNN hyperparameters for BRSET.")
     p.add_argument("--root", type=Path, required=True, help="Dataset root directory.")
     p.add_argument("--prepared-dir", type=Path, default=None, help="Directory containing train.csv/val.csv.")
-    p.add_argument("--train-manifest", type=str, default="patient_train_42.csv")
-    p.add_argument("--validation-manifest", type=str, default="patient_validation_42.csv")
+    
+    # Defaults updated to reflect image-level focus
+    p.add_argument("--prediction-level", choices=["patient", "image"], default="image")
+    p.add_argument("--train-manifest", type=str, default="image_train_42.csv")
+    p.add_argument("--validation-manifest", type=str, default="image_validation_42.csv")
+    
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--label-columns", nargs="*", default=None)
     p.add_argument("--demographic-columns", nargs="*", default=None)
@@ -136,55 +137,54 @@ def main() -> None:
     args = parse_args()
     root = args.root.expanduser().resolve()
     prepared_dir = args.prepared_dir.expanduser().resolve() if args.prepared_dir else (root / "prepared")
-    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else (root / "runs" / "patient_graph_tuning")
+    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else (root / "runs" / f"{args.prediction_level}_graph_tuning")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Environment & Hardware Setup [cite: 390]
+    # 1. Environment & Hardware Setup
     set_seed(args.seed, args.deterministic)
     device = select_device(args.device)
     print_runtime(device)
     amp_enabled = device.type == "cuda" and not args.no_amp
 
-    # 2. Metadata Extraction [cite: 276]
+    # 2. Metadata Extraction
     train_frame = pd.read_csv(prepared_dir / args.train_manifest)
     label_columns = infer_label_columns(train_frame, args.label_columns)
     demo_columns = infer_demographic_columns(train_frame, args.demographic_columns, label_columns)
     demo_specs = fit_demographic_specs(train_frame, demo_columns)
 
     # 3. Instantiate Modular Datasets (Memory-Loaded)
+    dataset_kwargs = {
+        "image_dir": root / "fundus_photos",
+        "target_cols": label_columns,
+        "demo_cols": demo_columns,
+        "demo_specs": demo_specs,
+        "image_size": args.image_size,
+        "patch_size": args.patch_size,
+        "connectivity": args.connectivity,
+        "prediction_level": args.prediction_level # <--- Passed directly to Dataset
+    }
+    
     train_dataset = BRSETGraphDataset(
         data=prepared_dir / args.train_manifest,
-        image_dir=root / "fundus_photos",
-        target_cols=label_columns,
-        demo_cols=demo_columns,
-        demo_specs=demo_specs,
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        connectivity=args.connectivity,
-        validate_paths=True
+        validate_paths=True,
+        **dataset_kwargs
     )
     
     val_dataset = BRSETGraphDataset(
         data=prepared_dir / args.validation_manifest,
-        image_dir=root / "fundus_photos",
-        target_cols=label_columns,
-        demo_cols=demo_columns,
-        demo_specs=demo_specs,
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        connectivity=args.connectivity,
-        validate_paths=False
+        validate_paths=False,
+        **dataset_kwargs
     )
 
-    # 4. Extract Targets to Calculate Modular Class Imbalance Weights [cite: 391]
-    train_targets = np.stack([s["label_vector"] for s in train_dataset.samples], axis=0)
+    # 4. Extract Targets to Calculate Modular Class Imbalance Weights
+    # np.vstack safely handles both 1D arrays (patient level) and 2D arrays (image level)
+    train_targets = np.vstack([s["label_vector"] for s in train_dataset.samples])
     pos_weight = calculate_positive_weights(train_targets).to(device)
 
-    print(f"\nStarting hyperparameter tuning over {args.num_trials} random trials...")
+    print(f"\nStarting {args.prediction_level.upper()}-LEVEL hyperparameter tuning over {args.num_trials} trials...")
 
-    # 5. Hyperparameter Tuning Loop [cite: 278]
+    # 5. Hyperparameter Tuning Loop
     for trial in range(1, args.num_trials + 1):
-        # Sample Hyperparameters
         h_dim = random.choice([32, 64, 128, 256])
         n_layers = random.choice([2, 3, 4])
         dropout = random.uniform(0.1, 0.75)
@@ -193,7 +193,6 @@ def main() -> None:
         print(f"\n=== [TRIAL {trial}/{args.num_trials}] ===")
         print(f"Parameters: h_dim={h_dim}, n_layers={n_layers}, drop={dropout:.4f}, batch={batch_size}")
 
-        # Instantiate DataLoaders via utils/data_functions.py
         train_loader = create_dataloader(
             dataset=train_dataset, batch_size=batch_size, shuffle=True, 
             num_workers=args.num_workers, pin_memory=(device.type == "cuda"), seed=args.seed
@@ -203,36 +202,34 @@ def main() -> None:
             num_workers=args.num_workers, pin_memory=(device.type == "cuda"), seed=args.seed
         )
 
-        # Build Model & Optimizer
         patch_dim = 3 * args.patch_size * args.patch_size + 2
         model = PatientGraphModel(
             patch_dim=patch_dim, num_labels=len(label_columns), demographic_specs=demo_specs,
-            hidden_dim=h_dim, num_layers=n_layers, dropout=dropout
+            hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
+            prediction_level=args.prediction_level # <--- Passed directly to Model
         ).to(device)
 
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
         scaler = make_grad_scaler(amp_enabled)
 
-        # Setup Logging Directories
         run_dir = output_dir / f"trial_{trial}_h{h_dim}_l{n_layers}"
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = run_dir / "final_checkpoint.pt"
         
         trial_config = {
+            "prediction_level": args.prediction_level,
             "trial": trial, "h_dim": h_dim, "n_layers": n_layers, "dropout": dropout,
             "batch_size": batch_size, "lr": args.learning_rate, "seed": args.seed,
         }
         write_json(run_dir / "run_config.json", trial_config)
 
-        # Start WandB using utils/logger.py [cite: 392]
-        run_name = f"{args.wandb_run_name}-T{trial}-h{h_dim}-l{n_layers}" if args.wandb_run_name else f"tune-T{trial}"
+        run_name = f"{args.wandb_run_name}-T{trial}-h{h_dim}-l{n_layers}" if args.wandb_run_name else f"tune-{args.prediction_level}-T{trial}"
         wandb_run = start_wandb_run(
             project=args.wandb_project, run_name=run_name, config=trial_config, output_dir=run_dir,
             entity=args.wandb_entity, group=args.wandb_group, tags=args.wandb_tags, mode=args.wandb_mode
         )
 
-        # Core Training Loop utilizing graph_epoch from utils/train_functions.py
         history = []
         for epoch in range(1, args.epochs + 1):
             train_res = graph_epoch(
@@ -265,17 +262,23 @@ def main() -> None:
                     "val/macro_auroc": val_res["summary"]["macro_auroc"],
                 }, step=epoch)
 
-        # Save Final Model
         torch.save({"model_state_dict": model.state_dict(), "hyperparams": trial_config}, checkpoint_path)
 
-        # Post-Trial Evaluation & Predictions
+        # --- DYNAMIC EVALUATION ID EXTRACTION ---
         val_preds = (val_res["probabilities"] >= args.threshold).astype(np.int8)
         
-        # Save Predictions using utils/metrics.py
+        if args.prediction_level == "patient":
+            entity_ids = [s["patient_id"] for s in val_dataset.samples]
+            id_column = "patient_id"
+        else:
+            # Flatten out the image paths (using the stem/filename as the ID)
+            entity_ids = [path.stem for s in val_dataset.samples for path in s["image_paths"]]
+            id_column = "image_id"
+        
         save_predictions(
             path=run_dir / "validation_predictions.csv",
-            entity_ids=[s["patient_id"] for s in val_dataset.samples],
-            id_column_name="patient_id",
+            entity_ids=entity_ids,
+            id_column_name=id_column,
             label_names=label_columns,
             targets=val_res["targets"],
             probabilities=val_res["probabilities"],
@@ -285,7 +288,6 @@ def main() -> None:
         trial_final_metric = float(val_res["summary"]["macro_f1"] if args.monitor == "val_macro_f1" else val_res["loss"])
         write_json(run_dir / "summary.json", {"final_validation_metric": trial_final_metric, "validation": val_res["summary"]})
 
-        # Close WandB Run via utils/logger.py
         if wandb_run is not None:
             wandb_run.summary["final_validation_metric"] = trial_final_metric
             wandb.save(str(run_dir / "summary.json"))
@@ -293,7 +295,6 @@ def main() -> None:
         finish_wandb_run(wandb_run)
 
     print("\nHyperparameter tuning complete across all trials!")
-
 
 if __name__ == "__main__":
     main()
