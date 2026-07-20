@@ -40,7 +40,7 @@ class BRSETDataSplitter:
         # Targets and required columns
         self.targets = target_labels
 
-        self.require_columns = [
+        self.required_columns = [
             "image_id",
             "patient_id",
             "quality",
@@ -72,9 +72,49 @@ class BRSETDataSplitter:
         print("Data splitting complete!")
 
     # Internal helper methods
-
     def _load_and_validate_metadata(self):
-        pass
+        self.df = pd.read_csv(self.csv_path)
+
+        # Check for missing required columns
+        missing_columns = sorted(
+            set(self.required_columns) - set(self.df.columns)
+        )
+        if missing_columns:
+            raise ValueError(f"Missing columns in CSV: {missing_columns}")
+        
+        #  Check for missing values in required columns
+        if self.df["image_id"].isna().any():
+            raise ValueError("Missing values found in 'image_id' column.")
+        if self.df["patient_id"].isna().any():
+            raise ValueError("Missing values found in 'patient_id' column.")
+        if self.df["image_id"].duplicated().any():
+            raise ValueError("Duplicate values found in 'image_id' column.")
+        
+        # Strip ID and quality columns
+        self.df["image_id"] = self.df["image_id"].astype(str).str.strip()
+        self.df["patient_id"] = self.df["patient_id"].astype(str).str.strip()
+        self.df["quality"] = self.df["quality"].astype(str).str.strip().str.lower()
+
+        # Check that all target columns contain binary values (0 or 1) and convert to int8
+        for target in self.targets:
+            values = pd.to_numeric(self.df[target], errors='coerce')
+
+            if values.isna().any() or not values.isin([0, 1]).all():
+                raise ValueError(f"Invalid values found in target column '{target}'. Expected binary values (0 or 1).")
+
+            self.df[target] = values.astype("int8")
+        
+        # Check the DR Scale columns for valid integer values (0-4) and convert to int8
+        for col in ["DR_SDRG", "DR_ICDR"]:
+            values = pd.to_numeric(self.df[col], errors='coerce')
+
+            if values.isna().any() or not values.isin([0, 1, 2, 3, 4]).all():
+                raise ValueError(f"Invalid values found in column '{col}'. Expected integer values (0-4).")
+
+            self.df[col] = values.astype("int8")
+        
+        self.df["image_name"] = self.df["image_id"].apply(lambda x: f"{x}.jpg")
+        self.df["image_path"] = self.df["image_name"].apply(lambda x: self.image_directory / x)
 
     def _filter_eligible_cohort(self):
         pass
