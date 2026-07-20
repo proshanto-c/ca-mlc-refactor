@@ -71,6 +71,13 @@ class BRSETDataSplitter:
         self._audit_split_prevalence()
         self._save_manifests()
 
+        print(self.df("split").agg(
+            images=("image_id", "size"),
+            patients=("patient_id", "nunique")
+        ))
+
+        print(self.prevalence_table)
+
         print("Data splitting complete!")
 
 
@@ -230,10 +237,70 @@ class BRSETDataSplitter:
 
         if self.df["split"].isna().any():
             raise ValueError("Some patients were not assigned to any split. Check the splitting logic.")
+
+        patient_splits = stratification.reset_index()
+        patient_splits["split"] = patient_splits["patient_id"].map(patient_split_map)
+
+        patient_splits.to_csv(
+            self.output_directory / f"{self.split_basis}_patient_splits_{self.seed}.csv",
+            index=False
+        )
         
 
     def _audit_split_prevalence(self):
-        pass
+        # Produce a prevalence audit
+        split_prevalence = (
+            self.df.groupby("split")[self.targets]
+            .agg(["sum", "mean"])
+        )
+
+        overall_prevalence = self.df[self.targets].mean()
+
+        prevalence_rows = []
+
+        for split_name in [
+            "train",
+            "validation",
+            "evaluation"
+        ]:
+            subset = self.df[self.df["split"].eq(split_name)]
+
+            for target in self.targets:
+                prevalence = float(subset[target].mean())
+                overall = float(overall_prevalence[target])
+
+                prevalence_rows.append({
+                    "split": split_name,
+                    "target": target,
+                    "images": len(subset),
+                    "patients": subset["patient_id"].nunique(),
+                    "positive_images": int(subset[target].sum()),
+                    "prevalence": prevalence,
+                    "overall_prevalence": overall,
+                    "absolute_deviation": abs(prevalence - overall)
+                })
+        
+        self.prevalence_table = pd.DataFrame(prevalence_rows)
+
+        self.prevalence_table.to_csv(
+            self.output_directory / f"{self.split_basis}_split_prevalence_{self.seed}.csv",
+            index=False
+        )
+
     
     def _save_manifests(self):
-        pass
+        self.df = self.df.sort_values(["split", "patient_id", "image_id"]).reset_index(drop=True)
+
+        # Save full cohort manifest
+        self.df.to_csv(self.output_directory / f"{self.split_basis}_cohort_{self.seed}.csv", index=False)
+
+        # Save individual split manifests
+        for split_name, filename in [
+            ("train", f"{self.split_basis}_train_{self.seed}.csv"),
+            ("validation", f"{self.split_basis}_validation_{self.seed}.csv"),
+            ("evaluation", f"{self.split_basis}_evaluation_{self.seed}.csv")
+        ]:
+            self.df[self.df["split"].eq(split_name)].to_csv(
+                self.output_directory / filename,
+                index=False
+            )
