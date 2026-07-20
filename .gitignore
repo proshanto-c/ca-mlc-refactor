@@ -9,6 +9,7 @@
 
 !utils/
 !utils/** 
+!generate_splits.py
 
 !gnn/
 !gnn/**
