@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 import pandas as pd
 from PIL import Image
+import numpy as np
+from interstrat.ml_stratifiers import MultiLabelStratifiedShuffleSplit
 
 class BRSETDataSplitter:
     def __init__(self,
@@ -66,7 +68,6 @@ class BRSETDataSplitter:
         self._filter_eligible_cohort()
         self._verify_cohort_images()
         self._generate_splits()
-        self._validate_split_integrity()
         self._audit_split_prevalence()
         self._save_manifests()
 
@@ -154,11 +155,82 @@ class BRSETDataSplitter:
             with Image.open(image_path) as image:
                 image.verify()
     
+    # Generate stratified training, validation, and evaluation splits based on the specified ratios and split basis
     def _generate_splits(self):
-        pass
+        # Splits are generated based on patient_id, regardless of whether the split_basis is "patient" or "image", 
+        # to ensure that all images from a single patient are in the same split.
+        # This is important for preventing data leakage and ensuring that the model is evaluated on unseen patients
 
-    def _validate_split_integrity(self):
-        pass
+        # Get stratification counts
+        patient_target_counts = (
+            self.df.groupby("patient_id")[self.targets]
+            .sum()
+            .sort_index()
+        )
+
+        # Because patients can have a variable number of images (1-4), we binarize the patient-level target counts to 
+        # create a stratification label for each patient. If a patient has the target condition present in any of 
+        # their images, they are labeled as 1 for that target; otherwise, they are labeled as 0.
+        stratification = (patient_target_counts > 0).astype("int8")
+
+        patient_ids = stratification.index.to_numpy()
+        y = stratification.to_numpy(dtype=np.int8)
+        x = np.zeros((len(patient_ids), 1), dtype=np.int8)  # Dummy feature array for stratification
+
+        # Calculate ratio for first split (train vs. val+test)
+        temp_ratio = self.val_ratio + self.test_ratio
+
+        first_splitter = MultiLabelStratifiedShuffleSplit(
+            n_splits=1, 
+            test_size=temp_ratio, 
+            random_state=self.seed
+        )
+        
+        train_indices, temp_indices = next(first_splitter.split(x, y))
+
+        train_patient_ids = patient_ids[train_indices]
+        temp_patient_ids = patient_ids[temp_indices]
+        temp_y = y[temp_indices]
+
+        # Calculate ratio for second split (val vs. test)
+        test_ratio_adjusted = self.test_ratio / temp_ratio
+
+        second_splitter = MultiLabelStratifiedShuffleSplit(
+            n_splits=1,
+            test_size=test_ratio_adjusted,
+            random_state=self.seed
+        )
+
+        validation_relative, evaluation_relative = next(
+            second_splitter.split(
+                np.zeros((len(temp_patient_ids), 1), dtype=np.int8), 
+                temp_y
+            )
+        )
+
+        validation_patient_ids = temp_patient_ids[validation_relative]
+        evaluation_patient_ids = temp_patient_ids[evaluation_relative]
+
+        # Validate split integrity
+        train_patients = set(train_patient_ids)
+        validation_patients = set(validation_patient_ids)
+        evaluation_patients = set(evaluation_patient_ids)
+
+        assert train_patients.isdisjoint(validation_patients)
+        assert train_patients.isdisjoint(evaluation_patients)
+        assert validation_patients.isdisjoint(evaluation_patients)
+
+        # Assign splits to the main dataframe based on patient IDs
+        patient_split_map = {}
+        patient_split_map.update({p_id: "train" for p_id in train_patient_ids})
+        patient_split_map.update({p_id: "validation" for p_id in validation_patient_ids})
+        patient_split_map.update({p_id: "evaluation" for p_id in evaluation_patient_ids})
+
+        self.df["split"] = self.df["patient_id"].map(patient_split_map)
+
+        if self.df["split"].isna().any():
+            raise ValueError("Some patients were not assigned to any split. Check the splitting logic.")
+        
 
     def _audit_split_prevalence(self):
         pass
