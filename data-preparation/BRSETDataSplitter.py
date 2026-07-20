@@ -71,6 +71,7 @@ class BRSETDataSplitter:
 
         print("Data splitting complete!")
 
+
     # Internal helper methods
     def _load_and_validate_metadata(self):
         self.df = pd.read_csv(self.csv_path)
@@ -116,8 +117,31 @@ class BRSETDataSplitter:
         self.df["image_name"] = self.df["image_id"].apply(lambda x: f"{x}.jpg")
         self.df["image_path"] = self.df["image_name"].apply(lambda x: self.image_directory / x)
 
+    # Filter the dataset to only include eligible images based on user-specified criteria
     def _filter_eligible_cohort(self):
-        pass
+
+        # Filter out any images with conflicting DR labels between scaling and diabetic_retinopathy target
+        self.df["dr_from_sdrg"] = self.df["DR_SDRG"].apply(lambda x: 1 if x >= 1 else 0)
+        self.df["dr_from_icdr"] = self.df["DR_ICDR"].apply(lambda x: 1 if x >= 1 else 0)
+
+        self.df["dr_disagreement"] = (self.df["dr_from_sdrg"].ne(self.df["diabetic_retinopathy"]) | self.df["dr_from_icdr"].ne(self.df["diabetic_retinopathy"]))
+        # Remove images with disagreement in DR labels
+        self.df = self.df[~self.df["dr_disagreement"]].copy()
+
+        #  Filter for only adequate quality images if specified
+        if self.adequate_only:
+            self.df = self.df[self.df["quality"] == "adequate"]
+        
+        # Filter for patients with at least 2 images if splitting by patient
+        if self.split_basis == "patient":
+            patient_counts = self.df.groupby("patient_id").size()
+            eligible_patients = patient_counts[patient_counts >= 2].index
+            self.df = self.df[self.df["patient_id"].isin(eligible_patients)]
+            # Keep only the first two images per patient for splitting purposes
+            self.df = self.df.groupby("patient_id").head(2).reset_index(drop=True)
+        
+        print(f"Eligible cohort size after user filters: {len(self.df)} images from {self.df['patient_id'].nunique()} patients.")
+
 
     def _verify_cohort_images(self):
         pass
