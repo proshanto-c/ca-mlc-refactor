@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image
 import numpy as np
-from interstrat.ml_stratifiers import MultiLabelStratifiedShuffleSplit
+from iterstrat.ml_stratifiers import MultiLabelStratifiedShuffleSplit
 
 class BRSETDataSplitter:
     def __init__(self,
