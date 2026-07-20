@@ -4,8 +4,12 @@
 !LICENSE
 !README.md
 
-!data-functions/
-!data-functions/**
+!data_functions/
+!data_functions/**
 
 !utils/
 !utils/** 
+
+!gnn/
+!gnn/**
+!tune_gnn.py

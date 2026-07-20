@@ -1,13 +1,14 @@
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import HeteroData
+import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 from PIL import Image
 from pathlib import Path
 from typing import Any, List, Dict, Union, Optional, Callable
 
-def patchify(image: torch.Tensor, patch_size: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+def patchify(image: torch.Tensor, patch_size: int):
     if image.dim() != 3:
         raise ValueError("Expected image tensor shaped [C, H, W].")
 
