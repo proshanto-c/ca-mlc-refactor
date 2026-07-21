@@ -14,3 +14,5 @@
 !gnn/
 !gnn/**
 !tune_gnn.py
+
+**/__pycache__/**

@@ -33,6 +33,10 @@ def parse_args() -> argparse.Namespace:
         "--seed", type=int, default=42, help="Random seed for reproducibility."
     )
     parser.add_argument(
+        "--target-labels", type=list, default=["diabetic_retinopathy", "macular_edema", "amd", 
+                                               "myopic_fundus", "increased_cup_disc"], help="Target labels."
+    )
+    parser.add_argument(
         "--keep-inadequate", 
         action="store_true", 
         help="If flagged, includes images marked as inadequate quality."
@@ -61,6 +65,7 @@ def main():
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         seed=args.seed,
+        target_labels=args.target_labels,
         adequate_only=not args.keep_inadequate,
         split_basis=args.split_basis
     )

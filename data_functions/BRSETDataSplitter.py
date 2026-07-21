@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image
 import numpy as np
-from iterstrat.ml_stratifiers import MultiLabelStratifiedShuffleSplit
+from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 class BRSETDataSplitter:
     def __init__(self,
@@ -71,7 +71,7 @@ class BRSETDataSplitter:
         self._audit_split_prevalence()
         self._save_manifests()
 
-        print(self.df("split").agg(
+        print(self.df.groupby("split").agg(
             images=("image_id", "size"),
             patients=("patient_id", "nunique")
         ))
@@ -187,7 +187,7 @@ class BRSETDataSplitter:
         # Calculate ratio for first split (train vs. val+test)
         temp_ratio = self.val_ratio + self.test_ratio
 
-        first_splitter = MultiLabelStratifiedShuffleSplit(
+        first_splitter = MultilabelStratifiedShuffleSplit(
             n_splits=1, 
             test_size=temp_ratio, 
             random_state=self.seed
@@ -202,7 +202,7 @@ class BRSETDataSplitter:
         # Calculate ratio for second split (val vs. test)
         test_ratio_adjusted = self.test_ratio / temp_ratio
 
-        second_splitter = MultiLabelStratifiedShuffleSplit(
+        second_splitter = MultilabelStratifiedShuffleSplit(
             n_splits=1,
             test_size=test_ratio_adjusted,
             random_state=self.seed

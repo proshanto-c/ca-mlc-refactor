@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import HeteroData
+from torchvision import transforms
 import torch.nn.functional as F
 import pandas as pd
 import numpy as np
@@ -68,7 +69,6 @@ def grid_edge_index(grid_h: int, grid_w: int, connectivity: int, device=None) ->
 class BRSETGraphDataset(Dataset):
     """
     Heterogeneous Graph Dataset for Patient-Level or Image-Level BRSET predictions.
-    Consumes a DataFrame and builds heterogeneous graphs per patient.
     """
     def __init__(
         self,
@@ -82,7 +82,7 @@ class BRSETGraphDataset(Dataset):
         connectivity: int = 4,
         transform: Optional[Callable] = None,
         validate_paths: bool = True,
-        prediction_level: str = "patient"  # Added parameter to toggle graph structure
+        prediction_level: str = "patient"
     ) -> None:
         
         if prediction_level not in ["patient", "image"]:
@@ -106,16 +106,62 @@ class BRSETGraphDataset(Dataset):
         self.transform = transform
         self.prediction_level = prediction_level
         
+        self._cache_vision_edges() 
         self.samples = []
-        self._build_patient_samples(validate_paths)
+        
+        # Updated to handle branching graph logic
+        self._build_samples(validate_paths)
 
-    def _build_patient_samples(self, validate: bool) -> None:
-        """Groups the flat DataFrame into patient-level data structures."""
-        for patient_id, group in self.frame.groupby("patient_id", sort=True):
-            image_paths = []
-            eye_ids = []
-            
-            for _, row in group.iterrows():
+    def _cache_vision_edges(self) -> None:
+        """Pre-calculates the static grid edges to prevent redundant math in __getitem__."""
+        self.grid_h = self.image_size // self.patch_size
+        self.grid_w = self.image_size // self.patch_size
+        self.n_patches = self.grid_h * self.grid_w
+        
+        # 1. Cache Spatial Adjacency
+        adj = grid_edge_index(self.grid_h, self.grid_w, self.connectivity, device=torch.device('cpu'))
+        self.base_patch_adj_src = adj[0]
+        self.base_patch_adj_dst = adj[1]
+        
+        # 2. Cache Hierarchical Adjacency
+        self.base_patch_to_img_src = torch.arange(self.n_patches, dtype=torch.long)
+        self.base_patch_to_img_dst = torch.zeros(self.n_patches, dtype=torch.long)
+
+    def _build_samples(self, validate: bool) -> None:
+        """Constructs either multi-image patient hubs or single-image standalone graphs."""
+        
+        if self.prediction_level == "patient":
+            # --- BATCH BY PATIENT ---
+            for patient_id, group in self.frame.groupby("patient_id", sort=True):
+                image_paths = []
+                eye_ids = []
+                
+                for _, row in group.iterrows():
+                    raw_path = row.get("image_path", f"fundus_photos/{row['image_id']}.jpg")
+                    p = Path(raw_path)
+                    p = p if p.is_absolute() else self.image_dir / p
+                    
+                    if validate and not p.is_file():
+                        raise FileNotFoundError(f"Missing image: {p}")
+                    
+                    image_paths.append(p)
+                    eye_val = row.get("exam_eye", -1)
+                    eye_ids.append(int(float(eye_val)) if pd.notna(eye_val) else -1)
+                
+                label_vector = group[self.target_cols].max().to_numpy(dtype=np.float32)
+                demographic_values = {col: group[col].dropna().mode()[0] if not group[col].dropna().empty else None for col in self.demo_cols}
+                
+                self.samples.append({
+                    "patient_id": str(patient_id),
+                    "image_paths": image_paths,
+                    "eye_ids": eye_ids,
+                    "label_vector": label_vector,
+                    "demographics": demographic_values
+                })
+                
+        else:
+            # --- BATCH BY IMAGE ---
+            for _, row in self.frame.iterrows():
                 raw_path = row.get("image_path", f"fundus_photos/{row['image_id']}.jpg")
                 p = Path(raw_path)
                 p = p if p.is_absolute() else self.image_dir / p
@@ -123,31 +169,19 @@ class BRSETGraphDataset(Dataset):
                 if validate and not p.is_file():
                     raise FileNotFoundError(f"Missing image: {p}")
                 
-                image_paths.append(p)
-                
                 eye_val = row.get("exam_eye", -1)
-                eye_ids.append(int(float(eye_val)) if pd.notna(eye_val) else -1)
-            
-            # --- DYNAMIC TARGET AGGREGATION ---
-            if self.prediction_level == "patient":
-                # Shape: [Num_Labels] - If any image is positive, patient is positive
-                label_vector = group[self.target_cols].max().to_numpy(dtype=np.float32)
-            else:
-                # Shape: [Num_Images, Num_Labels] - Keep labels distinct per image
-                label_vector = group[self.target_cols].to_numpy(dtype=np.float32)
-            
-            demographic_values = {
-                col: group[col].dropna().mode()[0] if not group[col].dropna().empty else None 
-                for col in self.demo_cols
-            }
-            
-            self.samples.append({
-                "patient_id": str(patient_id),
-                "image_paths": image_paths,
-                "eye_ids": eye_ids,
-                "label_vector": label_vector,
-                "demographics": demographic_values
-            })
+                eye_id = int(float(eye_val)) if pd.notna(eye_val) else -1
+                label_vector = row[self.target_cols].to_numpy(dtype=np.float32)
+                demographic_values = {col: row[col] if pd.notna(row[col]) else None for col in self.demo_cols}
+                
+                self.samples.append({
+                    "patient_id": str(row["patient_id"]),
+                    "image_id": str(row["image_id"]), # Saved explicitly for logging
+                    "image_paths": [p], # Passed as list to reuse vision logic
+                    "eye_ids": [eye_id],
+                    "label_vector": label_vector,
+                    "demographics": demographic_values
+                })
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -156,13 +190,12 @@ class BRSETGraphDataset(Dataset):
         sample = self.samples[index]
         data = HeteroData()
         
-        # 1. Global Target Assignment (Shape matching the prediction level)
-        if self.prediction_level == "patient":
-            data.y = torch.tensor(sample["label_vector"], dtype=torch.float32).unsqueeze(0)
-        else:
-            data.y = torch.tensor(sample["label_vector"], dtype=torch.float32)
+        # 1. Global Target Assignment
+        # Because 1 sample = 1 graph (whether it contains 1 patient or 1 image), 
+        # we always unsqueeze to shape [1, Num_Labels] so PyG batches it into [Batch_Size, Num_Labels]
+        data.y = torch.tensor(sample["label_vector"], dtype=torch.float32).unsqueeze(0)
         
-        # 2. Setup Base Nodes (Patient and Labels)
+        # 2. Setup Base Nodes
         num_labels = len(self.target_cols)
         num_images = len(sample["image_paths"])
         
@@ -173,18 +206,16 @@ class BRSETGraphDataset(Dataset):
         # 3. Setup Demographic Nodes
         self._attach_demographics(data, sample["demographics"])
         
-        # 4. Setup Image & Patch Nodes with Edge Connections
+        # 4. Setup Image & Patch Nodes with Fast Edge Connections
         self._attach_vision_nodes(data, sample)
         
-        # 5. Setup Structural Edges (Dynamically drawing Patient vs Image edges)
+        # 5. Setup Structural Edges
         self._attach_structural_edges(data, num_labels, num_images)
         
         return data
 
     def _attach_demographics(self, data: HeteroData, demo_dict: Dict) -> None:
-        """Encodes demographic specs into node features and attaches them to the graph."""
         num_demo = len(self.demo_specs)
-        
         field_idx = torch.arange(num_demo, dtype=torch.long)
         kind = torch.tensor([0 if s.kind == "numeric" else 1 for s in self.demo_specs], dtype=torch.long)
         num_value = torch.zeros((num_demo, 1), dtype=torch.float32)
@@ -214,7 +245,6 @@ class BRSETGraphDataset(Dataset):
         data["demographic"].missing = missing
 
     def _attach_vision_nodes(self, data: HeteroData, sample: Dict) -> None:
-        """Loads images, creates patches, and draws edges between patches, images, and the patient."""
         num_images = len(sample["image_paths"])
         
         data["image"].x = torch.zeros((num_images, 1), dtype=torch.float32)
@@ -224,80 +254,77 @@ class BRSETGraphDataset(Dataset):
             dtype=torch.long
         )
         
-        patch_features_list: List[torch.Tensor] = []
-        patch_adj_src, patch_adj_dst = [], []
-        patch_to_img_src, patch_to_img_dst = [], []
-        img_to_patch_src, img_to_patch_dst = [], []
-        img_to_patient_src, img_to_patient_dst = [], []
-        patient_to_img_src, patient_to_img_dst = [], []
+        patch_features_list = []
         
-        patch_offset = 0
+        # Edge accumulators
+        p_adj_src, p_adj_dst = [], []
+        p2i_src, p2i_dst = [], []
+        i2p_src, i2p_dst = [], []
+        i2pat_src, i2pat_dst = [], []
+        pat2i_src, pat2i_dst = [], []
         
         for img_idx, path in enumerate(sample["image_paths"]):
             with Image.open(path) as img:
                 img = img.convert("RGB")
                 if self.transform:
                     img = self.transform(img)
+                if not isinstance(img, torch.Tensor):
+                    img = transforms.ToTensor()(img)
             
-            # Using your original patchify utility
-            patches, coords, grid_h, grid_w = patchify(img, self.patch_size)
-            patch_feat = torch.cat([patches, coords], dim=-1)
-            patch_features_list.append(patch_feat)
+            patches, coords, _, _ = patchify(img, self.patch_size)
+            patch_features_list.append(torch.cat([patches, coords], dim=-1))
             
-            # Using your original grid_edge_index utility
-            adj = grid_edge_index(grid_h, grid_w, self.connectivity, device=patch_feat.device)
-            patch_adj_src.extend((adj[0] + patch_offset).tolist())
-            patch_adj_dst.extend((adj[1] + patch_offset).tolist())
+            # --- THE OPTIMIZATION: USE CACHED EDGES WITH OFFSETS ---
+            patch_offset = img_idx * self.n_patches
             
-            n_patches = patch_feat.size(0)
+            # 1. Patch <-> Patch (shifted by offset)
+            p_adj_src.append(self.base_patch_adj_src + patch_offset)
+            p_adj_dst.append(self.base_patch_adj_dst + patch_offset)
             
-            for local_patch in range(n_patches):
-                global_patch = patch_offset + local_patch
-                patch_to_img_src.append(global_patch)
-                patch_to_img_dst.append(img_idx)
-                
-                img_to_patch_src.append(img_idx)
-                img_to_patch_dst.append(global_patch)
-                
-            img_to_patient_src.append(img_idx)
-            img_to_patient_dst.append(0) 
+            # 2. Patch <-> Image (Patch IDs shifted, Image ID is img_idx)
+            shifted_p2i_src = self.base_patch_to_img_src + patch_offset
+            shifted_p2i_dst = self.base_patch_to_img_dst + img_idx
             
-            patient_to_img_src.append(0)
-            patient_to_img_dst.append(img_idx)
+            p2i_src.append(shifted_p2i_src)
+            p2i_dst.append(shifted_p2i_dst)
+            i2p_src.append(shifted_p2i_dst)
+            i2p_dst.append(shifted_p2i_src)
             
-            patch_offset += n_patches
+            # 3. Image <-> Patient (Patient is always 0)
+            i2pat_src.append(torch.tensor([img_idx], dtype=torch.long))
+            i2pat_dst.append(torch.tensor([0], dtype=torch.long))
+            pat2i_src.append(torch.tensor([0], dtype=torch.long))
+            pat2i_dst.append(torch.tensor([img_idx], dtype=torch.long))
             
+        # 4. Attach to Data (Fast Concatenation)
         data["patch"].x = torch.cat(patch_features_list, dim=0)
         
-        data[("patch", "adjacent", "patch")].edge_index = torch.tensor(
-            [patch_adj_src, patch_adj_dst], dtype=torch.long
-        )
-        data[("patch", "to", "image")].edge_index = torch.tensor(
-            [patch_to_img_src, patch_to_img_dst], dtype=torch.long
-        )
-        data[("image", "to", "patch")].edge_index = torch.tensor(
-            [img_to_patch_src, img_to_patch_dst], dtype=torch.long
-        )
-        data[("image", "to", "patient")].edge_index = torch.tensor(
-            [img_to_patient_src, img_to_patient_dst], dtype=torch.long
-        )
-        data[("patient", "to", "image")].edge_index = torch.tensor(
-            [patient_to_img_src, patient_to_img_dst], dtype=torch.long
-        )
+        data[("patch", "adjacent", "patch")].edge_index = torch.stack([
+            torch.cat(p_adj_src), torch.cat(p_adj_dst)
+        ], dim=0)
+        
+        data[("patch", "to", "image")].edge_index = torch.stack([
+            torch.cat(p2i_src), torch.cat(p2i_dst)
+        ], dim=0)
+        
+        data[("image", "to", "patch")].edge_index = torch.stack([
+            torch.cat(i2p_src), torch.cat(i2p_dst)
+        ], dim=0)
+        
+        data[("image", "to", "patient")].edge_index = torch.stack([
+            torch.cat(i2pat_src), torch.cat(i2pat_dst)
+        ], dim=0)
+        
+        data[("patient", "to", "image")].edge_index = torch.stack([
+            torch.cat(pat2i_src), torch.cat(pat2i_dst)
+        ], dim=0)
             
     def _attach_structural_edges(self, data: HeteroData, num_labels: int, num_images: int) -> None:
-        """Builds edges linking Demographics to Patient, and Target Labels to the specified structural level."""
         num_demo = len(self.demo_specs)
         
-        # Demographics <-> Patient
-        data[("demographic", "to", "patient")].edge_index = torch.tensor(
-            [list(range(num_demo)), [0] * num_demo], dtype=torch.long
-        )
-        data[("patient", "to", "demographic")].edge_index = torch.tensor(
-            [[0] * num_demo, list(range(num_demo))], dtype=torch.long
-        )
+        data[("demographic", "to", "patient")].edge_index = torch.tensor([list(range(num_demo)), [0] * num_demo], dtype=torch.long)
+        data[("patient", "to", "demographic")].edge_index = torch.tensor([[0] * num_demo, list(range(num_demo))], dtype=torch.long)
         
-        # Label <-> Label (Fully connected, skipping self-loops)
         corr_src, corr_dst = [], []
         for i in range(num_labels):
             for j in range(num_labels):
@@ -305,29 +332,16 @@ class BRSETGraphDataset(Dataset):
                     corr_src.append(i)
                     corr_dst.append(j)
                     
-        data[("label", "correlates", "label")].edge_index = torch.tensor(
-            [corr_src, corr_dst], dtype=torch.long
-        )
+        data[("label", "correlates", "label")].edge_index = torch.tensor([corr_src, corr_dst], dtype=torch.long)
         
-        # --- DYNAMIC LABEL PATHWAYS ---
         if self.prediction_level == "patient":
-            # Patient <-> Label
-            data[("patient", "to", "label")].edge_index = torch.tensor(
-                [[0] * num_labels, list(range(num_labels))], dtype=torch.long
-            )
-            data[("label", "to", "patient")].edge_index = torch.tensor(
-                [list(range(num_labels)), [0] * num_labels], dtype=torch.long
-            )
+            data[("patient", "to", "label")].edge_index = torch.tensor([[0] * num_labels, list(range(num_labels))], dtype=torch.long)
+            data[("label", "to", "patient")].edge_index = torch.tensor([list(range(num_labels)), [0] * num_labels], dtype=torch.long)
         elif self.prediction_level == "image":
-            # Image <-> Label (Connects every image to every label)
             img_src, lbl_dst = [], []
             for i in range(num_images):
                 img_src.extend([i] * num_labels)
                 lbl_dst.extend(list(range(num_labels)))
                 
-            data[("image", "to", "label")].edge_index = torch.tensor(
-                [img_src, lbl_dst], dtype=torch.long
-            )
-            data[("label", "to", "image")].edge_index = torch.tensor(
-                [lbl_dst, img_src], dtype=torch.long
-            )
+            data[("image", "to", "label")].edge_index = torch.tensor([img_src, lbl_dst], dtype=torch.long)
+            data[("label", "to", "image")].edge_index = torch.tensor([lbl_dst, img_src], dtype=torch.long)

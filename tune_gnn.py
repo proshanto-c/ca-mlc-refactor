@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 try:
     import wandb
@@ -18,6 +20,7 @@ except ImportError:
 
 # --- MODULAR IMPORTS ---
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
+from data_functions.CachedGraphDataset import CachedGraphDataset
 from gnn.patientgraphmodel import PatientGraphModel, DemographicSpec
 
 from utils.util_functions import (
@@ -43,8 +46,9 @@ DEFAULT_LABEL_CANDIDATES = [
 ]
 
 DEFAULT_DEMOGRAPHIC_CANDIDATES = [
-    "patient_age", "age", "patient_sex", "sex", "diabetes_time",
-    "diabetes_duration", "insulin_use", "comorbidities", "nationality", "exam_eye",
+    "patient_age", "age", "patient_sex", "sex", 
+    # "diabetes_time", "diabetes_duration", "insulin_use", "comorbidities", "nationality", 
+    "exam_eye",
 ]
 
 NUMERIC_HINTS = ("age", "time", "years", "duration", "count", "score", "num")
@@ -108,14 +112,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patch-size", type=int, default=32)
     p.add_argument("--connectivity", type=int, default=4, choices=[4, 8])
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--learning-rate", type=float, default=1e-4)
+    # p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--monitor", choices=["val_loss", "val_macro_f1"], default="val_loss")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=12)
     p.add_argument("--num-trials", type=int, default=10, help="Number of random search trials.")
 
     # W&B Arguments
@@ -152,6 +156,22 @@ def main() -> None:
     demo_columns = infer_demographic_columns(train_frame, args.demographic_columns, label_columns)
     demo_specs = fit_demographic_specs(train_frame, demo_columns)
 
+    # Define your transforms (crucially including Resize!)
+    train_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
     # 3. Instantiate Modular Datasets (Memory-Loaded)
     dataset_kwargs = {
         "image_dir": root / "fundus_photos",
@@ -163,16 +183,18 @@ def main() -> None:
         "connectivity": args.connectivity,
         "prediction_level": args.prediction_level # <--- Passed directly to Dataset
     }
-    
+
     train_dataset = BRSETGraphDataset(
         data=prepared_dir / args.train_manifest,
         validate_paths=True,
+        transform=train_transform,
         **dataset_kwargs
     )
     
     val_dataset = BRSETGraphDataset(
         data=prepared_dir / args.validation_manifest,
         validate_paths=False,
+        transform=val_transform,
         **dataset_kwargs
     )
 
@@ -186,20 +208,22 @@ def main() -> None:
     # 5. Hyperparameter Tuning Loop
     for trial in range(1, args.num_trials + 1):
         h_dim = random.choice([32, 64, 128, 256])
-        n_layers = random.choice([2, 3, 4])
-        dropout = random.uniform(0.1, 0.75)
-        batch_size = random.choice([16, 32, 64])
+        n_layers = random.choice([3, 4, 5])
+        dropout = random.uniform(0.1, 0.35)
+        batch_size = random.choice([32, 64])
+        learning_rate = random.choice([1e-4, 5e-4, 1e-3])
 
         print(f"\n=== [TRIAL {trial}/{args.num_trials}] ===")
-        print(f"Parameters: h_dim={h_dim}, n_layers={n_layers}, drop={dropout:.4f}, batch={batch_size}")
+        print(f"Parameters: h_dim={h_dim}, n_layers={n_layers}, drop={dropout:.4f}, batch={batch_size}, lr={learning_rate}")
 
         train_loader = create_dataloader(
             dataset=train_dataset, batch_size=batch_size, shuffle=True, 
-            num_workers=args.num_workers, pin_memory=(device.type == "cuda"), seed=args.seed
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda"), 
+            seed=args.seed, is_graph = True
         )
         val_loader = create_dataloader(
             dataset=val_dataset, batch_size=batch_size, shuffle=False, 
-            num_workers=args.num_workers, pin_memory=(device.type == "cuda"), seed=args.seed
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda"), seed=args.seed, is_graph = True
         )
 
         patch_dim = 3 * args.patch_size * args.patch_size + 2
@@ -210,7 +234,7 @@ def main() -> None:
         ).to(device)
 
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
         scaler = make_grad_scaler(amp_enabled)
 
         run_dir = output_dir / f"trial_{trial}_h{h_dim}_l{n_layers}"
@@ -220,7 +244,7 @@ def main() -> None:
         trial_config = {
             "prediction_level": args.prediction_level,
             "trial": trial, "h_dim": h_dim, "n_layers": n_layers, "dropout": dropout,
-            "batch_size": batch_size, "lr": args.learning_rate, "seed": args.seed,
+            "batch_size": batch_size, "lr": learning_rate, "seed": args.seed,
         }
         write_json(run_dir / "run_config.json", trial_config)
 
@@ -272,7 +296,7 @@ def main() -> None:
             id_column = "patient_id"
         else:
             # Flatten out the image paths (using the stem/filename as the ID)
-            entity_ids = [path.stem for s in val_dataset.samples for path in s["image_paths"]]
+            entity_ids = [s["image_id"] for s in val_dataset.samples]
             id_column = "image_id"
         
         save_predictions(
