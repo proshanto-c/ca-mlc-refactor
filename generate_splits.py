@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         "--seed", type=int, default=42, help="Random seed for reproducibility."
     )
     parser.add_argument(
-        "--target-labels", type=list, default=["diabetic_retinopathy", "macular_edema", "amd", 
+        "--target-labels", nargs="*", default=["diabetic_retinopathy", "macular_edema", "amd", 
                                                "myopic_fundus", "increased_cup_disc"], help="Target labels."
     )
     parser.add_argument(

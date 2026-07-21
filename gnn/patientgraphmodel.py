@@ -32,7 +32,8 @@ class PatientGraphModel(nn.Module):
         dropout: float = 0.1,
         max_images_per_patient: int = 32,
         heads: int = 2,
-        prediction_level: str = "patient",  # <--- This is the missing argument
+        prediction_level: str = "patient",
+        initial_biases: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         
@@ -117,7 +118,7 @@ class PatientGraphModel(nn.Module):
                 conv_dict[("image", "to", "label")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False)
                 conv_dict[("label", "to", "image")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False)
 
-            conv = HeteroConv(conv_dict, aggr="sum")
+            conv = HeteroConv(conv_dict, aggr="mean")
             self.convs.append(conv)
             
             self.norms.append(
@@ -136,8 +137,22 @@ class PatientGraphModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1, bias=False),
         )
+
+        self.image_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_labels, bias=False),
+        )
+
+        if initial_biases is not None:
+            bias_tensor = torch.tensor(initial_biases, dtype=torch.float32)
+        else:
+            bias_tensor = torch.zeros(num_labels, dtype=torch.float32)
+
+        self.output_bias = nn.Parameter(bias_tensor)
 
     def encode_demographics(self, data: HeteroData) -> torch.Tensor:
         field_idx = data["demographic"].field_idx.long()
@@ -188,9 +203,16 @@ class PatientGraphModel(nn.Module):
                     next_x[node_type] = x
             x_dict = next_x
 
-        logits = self.label_head(x_dict["label"]).squeeze(-1)
-        
-        # --- DYNAMIC OUTPUT SCALING ---
-        # Scales the final output based on whether it is predicting per-patient or per-image
-        num_targets = data[self.prediction_level].num_nodes
-        return logits.view(num_targets, self.num_labels)
+        # --- DYNAMIC OUTPUT ROUTING ---
+        if self.prediction_level == "patient":
+            # Read from the label nodes (which aggregate the whole patient's state)
+            logits = self.label_head(x_dict["label"]).squeeze(-1)
+            num_targets = data["patient"].num_nodes
+            logits = logits.view(num_targets, self.num_labels)
+            return logits + self.output_bias
+            
+        elif self.prediction_level == "image":
+            # Read directly from the enriched image nodes
+            # Output inherently matches shape [num_images, num_labels]
+            logits = self.image_head(x_dict["image"])
+            return logits + self.output_bias

@@ -20,7 +20,6 @@ except ImportError:
 
 # --- MODULAR IMPORTS ---
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
-from data_functions.CachedGraphDataset import CachedGraphDataset
 from gnn.patientgraphmodel import PatientGraphModel, DemographicSpec
 
 from utils.util_functions import (
@@ -41,7 +40,7 @@ from utils.logger import start_wandb_run, finish_wandb_run
 # =====================================================================
 
 DEFAULT_LABEL_CANDIDATES = [
-    ["target_dr", "target_dme", "target_amd", "target_myopic_fundus", "target_increased_cup_disc"],
+    # ["target_dr", "target_dme", "target_amd", "target_myopic_fundus", "target_increased_cup_disc"],
     ["diabetic_retinopathy", "macular_edema", "amd", "myopic_fundus", "increased_cup_disc"],
 ]
 
@@ -181,7 +180,7 @@ def main() -> None:
         "image_size": args.image_size,
         "patch_size": args.patch_size,
         "connectivity": args.connectivity,
-        "prediction_level": args.prediction_level # <--- Passed directly to Dataset
+        "prediction_level": args.prediction_level
     }
 
     train_dataset = BRSETGraphDataset(
@@ -226,11 +225,18 @@ def main() -> None:
             num_workers=args.num_workers, pin_memory=(device.type == "cuda"), seed=args.seed, is_graph = True
         )
 
+        train_targets = np.stack([s["label_vector"] for s in train_dataset.samples], axis=0)
+
+        pos_counts = np.maximum(train_targets.sum(axis=0), 1.0)
+        neg_counts = np.maximum(train_targets.shape[0] - pos_counts, 1.0)
+
+        adaptive_biases = np.log(pos_counts / neg_counts).astype(np.float32)
+
         patch_dim = 3 * args.patch_size * args.patch_size + 2
         model = PatientGraphModel(
             patch_dim=patch_dim, num_labels=len(label_columns), demographic_specs=demo_specs,
             hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
-            prediction_level=args.prediction_level # <--- Passed directly to Model
+            prediction_level=args.prediction_level, initial_biases=adaptive_biases
         ).to(device)
 
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)

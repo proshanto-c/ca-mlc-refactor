@@ -37,7 +37,8 @@ def graph_epoch(
     # Wrap the loader in a progress bar
     pbar = tqdm(loader, desc=desc, leave=False)
     
-    for batch in pbar:
+    accumulation_steps = 4
+    for i, batch in enumerate(pbar):
         batch = batch.to(device)
         
         with torch.set_grad_enabled(is_training):
@@ -48,7 +49,7 @@ def graph_epoch(
                 loss = criterion(logits, batch.y.view_as(logits).float())
 
             # 2. Backward Pass (Training Only)
-            if is_training:
+            if is_training and (i + 1) % accumulation_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None and amp_enabled:
                     scaler.scale(loss).backward()
