@@ -21,6 +21,7 @@ except ImportError:
 # --- MODULAR IMPORTS ---
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
 from gnn.patientgraphmodel import PatientGraphModel, DemographicSpec
+from utils.metrics import find_optimal_thresholds
 
 from utils.util_functions import (
     set_seed, 
@@ -33,7 +34,7 @@ from utils.data_functions import calculate_positive_weights, create_dataloader
 from utils.train_functions import graph_epoch
 from utils.metrics import save_predictions
 from utils.logger import start_wandb_run, finish_wandb_run
-
+from sklearn.metrics import f1_score, roc_auc_score
 
 # =====================================================================
 # 1. METADATA & DEMOGRAPHICS CONFIGURATION
@@ -232,9 +233,9 @@ def main() -> None:
 
         adaptive_biases = np.log(pos_counts / neg_counts).astype(np.float32)
 
-        patch_dim = 3 * args.patch_size * args.patch_size + 2
+        # patch_dim = 3 * args.patch_size * args.patch_size + 2
         model = PatientGraphModel(
-            patch_dim=patch_dim, num_labels=len(label_columns), demographic_specs=demo_specs,
+            num_labels=len(label_columns), demographic_specs=demo_specs,
             hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
             prediction_level=args.prediction_level, initial_biases=adaptive_biases
         ).to(device)
@@ -274,34 +275,87 @@ def main() -> None:
                 scaler=None, desc=f"T{trial} E{epoch:02d} Val", threshold=args.threshold
             )
 
+            # --- NEW: Calculate Real-Time Calibrated F1 ---
+            # We use step=0.05 here instead of 0.01 to make the calculation lightning fast 
+            # so it doesn't slow down your epoch times.
+            _, epoch_threshold_df = find_optimal_thresholds(
+                targets=val_res["targets"],
+                probabilities=val_res["probabilities"],
+                label_names=label_columns,
+                step=0.05 
+            )
+            epoch_calibrated_f1 = epoch_threshold_df["validation_f1"].mean()
+
+            # Update your local history CSV
             history.append({
                 "epoch": epoch,
                 "train_loss": train_res["loss"],
                 "val_loss": val_res["loss"],
-                "val_macro_f1": val_res["summary"]["macro_f1"],
+                "val_macro_f1_static": val_res["summary"]["macro_f1"],
+                "val_macro_f1_calibrated": epoch_calibrated_f1, # Save the true score!
                 "val_macro_auroc": val_res["summary"]["macro_auroc"]
             })
             pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
 
+            # Update WandB Real-Time Dashboard
             if wandb_run is not None:
-                wandb.log({
+                y_true = val_res["targets"]
+                y_prob = val_res["probabilities"]
+                
+                log_dict = {
                     "epoch": epoch,
                     "train/loss": train_res["loss"],
                     "val/loss": val_res["loss"],
-                    "val/macro_f1": val_res["summary"]["macro_f1"],
+                    "val/macro_f1_static": val_res["summary"]["macro_f1"],
+                    "val/macro_f1_calibrated": epoch_calibrated_f1,
                     "val/macro_auroc": val_res["summary"]["macro_auroc"],
-                }, step=epoch)
+                    # --- NEW: Log overall real-time macro averages ---
+                    "val/macro_accuracy_calibrated": epoch_threshold_df["validation_accuracy"].mean(),
+                    "val/macro_balanced_acc_calibrated": epoch_threshold_df["validation_balanced_accuracy"].mean(),
+                }
+
+                # Dynamically log per-class metrics
+                for idx, label in enumerate(label_columns):
+                    try:
+                        auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
+                    except ValueError:
+                        auroc = 0.0 
+                    
+                    log_dict[f"val_auroc_per_class/{label}"] = auroc
+                    log_dict[f"val_optimal_threshold/{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
+                    log_dict[f"val_calibrated_f1_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_f1"]
+                    
+                    # --- NEW: Log the perfectly calibrated Accuracies per disease ---
+                    log_dict[f"val_accuracy_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_accuracy"]
+                    log_dict[f"val_balanced_acc_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_balanced_accuracy"]
+
+                wandb.log(log_dict, step=epoch)
 
         torch.save({"model_state_dict": model.state_dict(), "hyperparams": trial_config}, checkpoint_path)
 
-        # --- DYNAMIC EVALUATION ID EXTRACTION ---
-        val_preds = (val_res["probabilities"] >= args.threshold).astype(np.int8)
+        # --- FINAL EVALUATION WITH OPTIMAL THRESHOLDS ---
+        # 1. Calculate the optimal threshold for each specific disease
+        best_thresholds, threshold_df = find_optimal_thresholds(
+            targets=val_res["targets"],
+            probabilities=val_res["probabilities"],
+            label_names=label_columns,
+            step=0.01
+        )
         
+        print("\n--- Calibrated Optimal Thresholds ---")
+        print(threshold_df.to_string(index=False))
+
+        # 2. Apply the specific threshold array to the probability matrix
+        val_preds = (val_res["probabilities"] >= best_thresholds).astype(np.int8)
+        
+        # 3. Extract the TRUE Macro F1 score
+        calibrated_macro_f1 = threshold_df["validation_f1"].mean()
+
+        # --- DYNAMIC EVALUATION ID EXTRACTION ---
         if args.prediction_level == "patient":
             entity_ids = [s["patient_id"] for s in val_dataset.samples]
             id_column = "patient_id"
         else:
-            # Flatten out the image paths (using the stem/filename as the ID)
             entity_ids = [s["image_id"] for s in val_dataset.samples]
             id_column = "image_id"
         
@@ -315,13 +369,31 @@ def main() -> None:
             predictions=val_preds
         )
 
-        trial_final_metric = float(val_res["summary"]["macro_f1"] if args.monitor == "val_macro_f1" else val_res["loss"])
-        write_json(run_dir / "summary.json", {"final_validation_metric": trial_final_metric, "validation": val_res["summary"]})
+        # 4. Tell the Sweep to use the Calibrated F1 score!
+        trial_final_metric = float(calibrated_macro_f1 if args.monitor == "val_macro_f1" else val_res["loss"])
+        
+        summary_data = {
+            "final_validation_metric": trial_final_metric,
+            "calibrated_macro_f1": float(calibrated_macro_f1),
+            "calibrated_thresholds": best_thresholds.tolist(),
+            "validation": val_res["summary"]
+        }
+        write_json(run_dir / "summary.json", summary_data)
 
         if wandb_run is not None:
+            # Log the top-level metrics
             wandb_run.summary["final_validation_metric"] = trial_final_metric
+            wandb_run.summary["calibrated_macro_f1"] = float(calibrated_macro_f1)
+            
+            # --- NEW: Log Calibrated F1 and Thresholds Per Label ---
+            for _, row in threshold_df.iterrows():
+                label = row["label"]
+                wandb_run.summary[f"calibrated_f1/{label}"] = row["validation_f1"]
+                wandb_run.summary[f"optimal_threshold/{label}"] = row["optimal_threshold"]
+            
             wandb.save(str(run_dir / "summary.json"))
             wandb.save(str(checkpoint_path))
+            
         finish_wandb_run(wandb_run)
 
     print("\nHyperparameter tuning complete across all trials!")

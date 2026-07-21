@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
 
@@ -24,7 +25,6 @@ class PatientGraphModel(nn.Module):
     """Heterogeneous Graph Neural Network for Patient-Level or Image-Level Predictions."""
     def __init__(
         self,
-        patch_dim: int,
         num_labels: int,
         demographic_specs: Sequence[DemographicSpec],
         hidden_dim: int = 128,
@@ -47,9 +47,23 @@ class PatientGraphModel(nn.Module):
         self.dropout = dropout
         self.max_images_per_patient = max_images_per_patient
 
+        # --- NEW: Load Pre-trained Vision Backbone ---
+        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        
+        # Strip the Global Average Pool and Fully Connected layer.
+        # This leaves us with a network that outputs spatial feature maps [B, 512, 8, 8]
+        self.cnn = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # Freeze the CNN (Highly recommended so you don't run out of GPU memory)
+        for param in self.cnn.parameters():
+            param.requires_grad = False
+
         # --- Node Encoders ---
+        cnn_out_dim = 512 # ResNet18 spatial features always have 512 channels
+        
+        # 2. UPDATE patch_encoder to accept cnn_out_dim instead of patch_dim
         self.patch_encoder = nn.Sequential(
-            nn.Linear(patch_dim, hidden_dim),
+            nn.Linear(cnn_out_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -183,8 +197,26 @@ class PatientGraphModel(nn.Module):
         return self.image_idx_embed(image_idx) + self.eye_idx_embed(eye_idx) + self.type_bias["image"]
 
     def forward(self, data: HeteroData) -> torch.Tensor:
+        
+        # --- RESNET FEATURE EXTRACTION ---
+        # 1. Get the batched raw images from PyG: [Total_Images_in_Batch, 3, 256, 256]
+        imgs = data["image"].raw_images 
+        
+        # 2. Extract Deep Spatial Features using the frozen ResNet
+        with torch.no_grad(): # Keep gradient graph small to save massive amounts of VRAM
+            features = self.cnn(imgs) # Output shape: [Total_Images, 512, 8, 8]
+            
+        # 3. Reshape the 8x8 grid into our 64 patch nodes
+        b, c, h, w = features.shape
+        # Permute to [Images, Y, X, Channels] then flatten the spatial dims
+        # Final shape: [Total_Images * 64, 512] -> Exactly matches our patch node count!
+        patch_features = features.permute(0, 2, 3, 1).reshape(-1, c)
+        
+        
+        # --- GNN MESSAGE PASSING ---
+        # 4. Standard GNN Dictionary Setup (Inject the new patch_features)
         x_dict = {
-            "patch": self.patch_encoder(data["patch"].x.float()) + self.type_bias["patch"],
+            "patch": self.patch_encoder(patch_features) + self.type_bias["patch"],
             "image": self.encode_images(data),
             "demographic": self.encode_demographics(data),
             "patient": self.patient_token.expand(data["patient"].num_nodes, -1) + self.type_bias["patient"],

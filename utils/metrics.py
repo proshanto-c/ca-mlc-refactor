@@ -94,11 +94,18 @@ def find_optimal_thresholds(
                 best_f1 = score
                 best_threshold = float(threshold)
                 
+        # --- Calculate Accuracy metrics using the winning threshold ---
+        best_prediction = (y_score >= best_threshold).astype(np.int8)
+        best_acc = safe_metric(accuracy_score, y_true, best_prediction, default=0.0)
+        best_bal_acc = safe_metric(balanced_accuracy_score, y_true, best_prediction, default=0.0)
+                
         best_thresholds.append(best_threshold)
         rows.append({
             "label": label,
             "optimal_threshold": best_threshold,
             "validation_f1": best_f1,
+            "validation_accuracy": best_acc, 
+            "validation_balanced_accuracy": best_bal_acc, 
         })
 
     return np.asarray(best_thresholds, dtype=np.float32), pd.DataFrame(rows)

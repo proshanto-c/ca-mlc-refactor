@@ -247,6 +247,7 @@ class BRSETGraphDataset(Dataset):
     def _attach_vision_nodes(self, data: HeteroData, sample: Dict) -> None:
         num_images = len(sample["image_paths"])
         
+        # 1. Base Image Nodes
         data["image"].x = torch.zeros((num_images, 1), dtype=torch.float32)
         data["image"].image_idx = torch.arange(num_images, dtype=torch.long)
         data["image"].eye_idx = torch.tensor(
@@ -254,34 +255,41 @@ class BRSETGraphDataset(Dataset):
             dtype=torch.long
         )
         
-        patch_features_list = []
+        # --- RESNET INTEGRATION: LOAD RAW IMAGES ---
+        image_tensors = []
+        for path in sample["image_paths"]:
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                if self.transform:
+                    img = self.transform(img) # MUST include Resize((256, 256))
+                if not isinstance(img, torch.Tensor):
+                    img = transforms.ToTensor()(img)
+            image_tensors.append(img)
+            
+        # Store the stacked images in the graph object!
+        # PyG will automatically batch these into [Batch_Size_Images, 3, 256, 256]
+        data["image"].raw_images = torch.stack(image_tensors, dim=0)
         
-        # Edge accumulators
+        # --- RESNET INTEGRATION: SETUP EMPTY PATCH NODES ---
+        # We need 64 patches per image. We create an empty tensor so PyG doesn't crash 
+        # when validating the edge connections. The ResNet will populate this later.
+        num_patches = num_images * self.n_patches 
+        data["patch"].x = torch.empty((num_patches, 0), dtype=torch.float32)
+        
+        
+        # 2. FAST EDGE CONNECTIONS (Using your cached grid edges)
         p_adj_src, p_adj_dst = [], []
         p2i_src, p2i_dst = [], []
         i2p_src, i2p_dst = [], []
         i2pat_src, i2pat_dst = [], []
         pat2i_src, pat2i_dst = [], []
         
-        for img_idx, path in enumerate(sample["image_paths"]):
-            with Image.open(path) as img:
-                img = img.convert("RGB")
-                if self.transform:
-                    img = self.transform(img)
-                if not isinstance(img, torch.Tensor):
-                    img = transforms.ToTensor()(img)
-            
-            patches, coords, _, _ = patchify(img, self.patch_size)
-            patch_features_list.append(torch.cat([patches, coords], dim=-1))
-            
-            # --- THE OPTIMIZATION: USE CACHED EDGES WITH OFFSETS ---
+        for img_idx in range(num_images):
             patch_offset = img_idx * self.n_patches
             
-            # 1. Patch <-> Patch (shifted by offset)
             p_adj_src.append(self.base_patch_adj_src + patch_offset)
             p_adj_dst.append(self.base_patch_adj_dst + patch_offset)
             
-            # 2. Patch <-> Image (Patch IDs shifted, Image ID is img_idx)
             shifted_p2i_src = self.base_patch_to_img_src + patch_offset
             shifted_p2i_dst = self.base_patch_to_img_dst + img_idx
             
@@ -290,34 +298,16 @@ class BRSETGraphDataset(Dataset):
             i2p_src.append(shifted_p2i_dst)
             i2p_dst.append(shifted_p2i_src)
             
-            # 3. Image <-> Patient (Patient is always 0)
             i2pat_src.append(torch.tensor([img_idx], dtype=torch.long))
             i2pat_dst.append(torch.tensor([0], dtype=torch.long))
             pat2i_src.append(torch.tensor([0], dtype=torch.long))
             pat2i_dst.append(torch.tensor([img_idx], dtype=torch.long))
             
-        # 4. Attach to Data (Fast Concatenation)
-        data["patch"].x = torch.cat(patch_features_list, dim=0)
-        
-        data[("patch", "adjacent", "patch")].edge_index = torch.stack([
-            torch.cat(p_adj_src), torch.cat(p_adj_dst)
-        ], dim=0)
-        
-        data[("patch", "to", "image")].edge_index = torch.stack([
-            torch.cat(p2i_src), torch.cat(p2i_dst)
-        ], dim=0)
-        
-        data[("image", "to", "patch")].edge_index = torch.stack([
-            torch.cat(i2p_src), torch.cat(i2p_dst)
-        ], dim=0)
-        
-        data[("image", "to", "patient")].edge_index = torch.stack([
-            torch.cat(i2pat_src), torch.cat(i2pat_dst)
-        ], dim=0)
-        
-        data[("patient", "to", "image")].edge_index = torch.stack([
-            torch.cat(pat2i_src), torch.cat(pat2i_dst)
-        ], dim=0)
+        data[("patch", "adjacent", "patch")].edge_index = torch.stack([torch.cat(p_adj_src), torch.cat(p_adj_dst)], dim=0)
+        data[("patch", "to", "image")].edge_index = torch.stack([torch.cat(p2i_src), torch.cat(p2i_dst)], dim=0)
+        data[("image", "to", "patch")].edge_index = torch.stack([torch.cat(i2p_src), torch.cat(i2p_dst)], dim=0)
+        data[("image", "to", "patient")].edge_index = torch.stack([torch.cat(i2pat_src), torch.cat(i2pat_dst)], dim=0)
+        data[("patient", "to", "image")].edge_index = torch.stack([torch.cat(pat2i_src), torch.cat(pat2i_dst)], dim=0)
             
     def _attach_structural_edges(self, data: HeteroData, num_labels: int, num_images: int) -> None:
         num_demo = len(self.demo_specs)
