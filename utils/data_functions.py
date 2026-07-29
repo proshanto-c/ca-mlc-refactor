@@ -14,6 +14,9 @@ def calculate_positive_weights(targets: np.ndarray) -> torch.Tensor:
     weights = np.divide(negatives, np.maximum(positives, 1.0), dtype=np.float32)
     weights[~np.isfinite(weights)] = 1.0
     weights[positives == 0] = 1.0
+    
+    # Dampen the weights using square root to prevent extreme clumping of probabilities
+    weights = np.sqrt(weights)
 
     return torch.tensor(weights, dtype=torch.float32)
 

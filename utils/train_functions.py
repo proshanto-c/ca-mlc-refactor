@@ -37,7 +37,6 @@ def graph_epoch(
     # Wrap the loader in a progress bar
     pbar = tqdm(loader, desc=desc, leave=False)
     
-    accumulation_steps = 4
     for i, batch in enumerate(pbar):
         batch = batch.to(device)
         
@@ -49,7 +48,7 @@ def graph_epoch(
                 loss = criterion(logits, batch.y.view_as(logits).float())
 
             # 2. Backward Pass (Training Only)
-            if is_training and (i + 1) % accumulation_steps == 0:
+            if is_training:
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None and amp_enabled:
                     scaler.scale(loss).backward()
@@ -120,7 +119,6 @@ def image_epoch(
     # Wrap the loader in a progress bar
     pbar = tqdm(loader, desc=desc, leave=False)
     
-    accumulation_steps = 4
     for i, batch in enumerate(pbar):
         # image dataset returns dict with "image" and "target"
         images = batch["image"].to(device)
@@ -133,7 +131,7 @@ def image_epoch(
                 loss = criterion(logits, targets.view_as(logits).float())
 
             # 2. Backward Pass
-            if is_training and (i + 1) % accumulation_steps == 0:
+            if is_training:
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None and amp_enabled:
                     scaler.scale(loss).backward()

@@ -159,9 +159,8 @@ def main() -> None:
     # Define your transforms (crucially including Resize!)
     train_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -278,13 +277,16 @@ def main() -> None:
             # --- NEW: Calculate Real-Time Calibrated F1 ---
             # We use step=0.05 here instead of 0.01 to make the calculation lightning fast 
             # so it doesn't slow down your epoch times.
-            _, epoch_threshold_df = find_optimal_thresholds(
+            best_thresholds, epoch_threshold_df = find_optimal_thresholds(
                 targets=val_res["targets"],
                 probabilities=val_res["probabilities"],
                 label_names=label_columns,
                 step=0.05 
             )
             epoch_calibrated_f1 = epoch_threshold_df["validation_f1"].mean()
+            
+            calibrated_predictions = (val_res["probabilities"] >= best_thresholds.reshape(1, -1)).astype(int)
+            epoch_calibrated_micro_f1 = f1_score(val_res["targets"], calibrated_predictions, average="micro", zero_division=0)
 
             # Update your local history CSV
             history.append({
@@ -292,7 +294,9 @@ def main() -> None:
                 "train_loss": train_res["loss"],
                 "val_loss": val_res["loss"],
                 "val_macro_f1_static": val_res["summary"]["macro_f1"],
+                "val_micro_f1_static": val_res["summary"]["micro_f1"],
                 "val_macro_f1_calibrated": epoch_calibrated_f1, # Save the true score!
+                "val_micro_f1_calibrated": epoch_calibrated_micro_f1,
                 "val_macro_auroc": val_res["summary"]["macro_auroc"]
             })
             pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
@@ -307,7 +311,9 @@ def main() -> None:
                     "train/loss": train_res["loss"],
                     "val/loss": val_res["loss"],
                     "val/macro_f1_static": val_res["summary"]["macro_f1"],
+                    "val/micro_f1_static": val_res["summary"]["micro_f1"],
                     "val/macro_f1_calibrated": epoch_calibrated_f1,
+                    "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
                     "val/macro_auroc": val_res["summary"]["macro_auroc"],
                     # --- NEW: Log overall real-time macro averages ---
                     "val/macro_accuracy_calibrated": epoch_threshold_df["validation_accuracy"].mean(),

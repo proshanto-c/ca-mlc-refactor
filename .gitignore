@@ -15,7 +15,6 @@
 !gnn/**
 !tune_gnn.py
 
-!convnext/
-!convnext/**
+!tune_convnext.py
 
 **/__pycache__/**

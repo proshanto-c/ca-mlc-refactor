@@ -73,16 +73,21 @@ def find_optimal_thresholds(
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     """
     Sweeps through probability thresholds to find the one that maximizes F1 score per label.
+    Uses percentiles of the predicted probabilities to dynamically adapt to highly skewed distributions.
     """
-    candidates = np.arange(step, 1.0, step, dtype=np.float64)
-    candidates = np.unique(np.clip(candidates, 0.001, 0.999))
-    
     best_thresholds = []
     rows = []
+
+    # Calculate percentiles to sweep based on the step size
+    percentiles = np.linspace(1, 99, int(1.0 / step))
 
     for index, label in enumerate(label_names):
         y_true = targets[:, index]
         y_score = probabilities[:, index]
+        
+        # Dynamically generate candidates based on the actual probability distribution for this label
+        candidates = np.percentile(y_score, percentiles)
+        candidates = np.unique(np.clip(candidates, 0.001, 0.999))
         
         best_threshold = 0.5
         best_f1 = -1.0
