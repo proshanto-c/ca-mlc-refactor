@@ -16,6 +16,7 @@ class BRSETImageDataset(Dataset):
         data: Union[Path, str, pd.DataFrame],
         image_dir: Path,
         target_cols: List[str],
+        demo_cols: Optional[List[str]] = None,
         transform: Optional[Callable] = None,
         validate_paths: bool = True
     ):
@@ -29,6 +30,7 @@ class BRSETImageDataset(Dataset):
         
         self.image_dir = Path(image_dir)
         self.target_cols = target_cols
+        self.demo_cols = demo_cols or []
         self.transform = transform
         
         # 2. Strict Schema Validation
@@ -41,6 +43,18 @@ class BRSETImageDataset(Dataset):
         self.image_ids = self.frame["image_id"].astype(str).tolist()
         self.patient_ids = self.frame["patient_id"].astype(str).tolist()
         self.targets = self.frame[self.target_cols].to_numpy(dtype=np.float32)
+        if self.demo_cols:
+            demo_df = self.frame[self.demo_cols].copy()
+            # Convert non-numeric (e.g. 'patient_sex' = 'M'/'F') into numeric codes
+            for col in self.demo_cols:
+                if demo_df[col].dtype == object or demo_df[col].dtype.name == 'category':
+                    demo_df[col] = demo_df[col].astype('category').cat.codes
+                    
+            # Fill missing values to prevent NaNs
+            demo_df = demo_df.fillna(0.0)
+            self.contexts = demo_df.to_numpy(dtype=np.float32)
+        else:
+            self.contexts = None
     
     def _validate_schema(self) -> None:
         required_cols = {"image_id", "patient_id"}.union(self.target_cols)
@@ -86,9 +100,13 @@ class BRSETImageDataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to load image at {path}.") from e
         
-        return {
+        out = {
             "image": img,
             "target": torch.from_numpy(self.targets[index].copy()),
             "image_id": self.image_ids[index],
             "patient_id": self.patient_ids[index],
         }
+        if self.contexts is not None:
+            out["context"] = torch.from_numpy(self.contexts[index].copy())
+            
+        return out

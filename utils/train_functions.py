@@ -127,7 +127,11 @@ def image_epoch(
         with torch.set_grad_enabled(is_training):
             # 1. Forward Pass
             with autocast_context(amp_enabled):
-                logits = model(images)
+                if "context" in batch:
+                    contexts = batch["context"].to(device)
+                    logits = model(images, contexts)
+                else:
+                    logits = model(images)
                 loss = criterion(logits, targets.view_as(logits).float())
 
             # 2. Backward Pass
