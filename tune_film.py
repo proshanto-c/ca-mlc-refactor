@@ -22,6 +22,7 @@ except ImportError:
 
 # --- MODULAR IMPORTS ---
 from data_functions.BRSETImageDataset import BRSETImageDataset
+from models.film_model import ContextFiLMConvNeXt
 from utils.metrics import find_optimal_thresholds
 from utils.losses import AsymmetricLossOptimized
 
@@ -58,7 +59,7 @@ def infer_label_columns(frame: pd.DataFrame, requested: Optional[List[str]]) -> 
 # =====================================================================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Tune ConvNeXt V2 hyperparameters for BRSET.")
+    p = argparse.ArgumentParser(description="Tune FiLM ConvNeXt for BRSET.")
     p.add_argument("--root", type=Path, required=True, help="Dataset root directory.")
     p.add_argument("--prepared-dir", type=Path, default=None, help="Directory containing train/val manifests.")
     
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     
     # Dummy arguments to seamlessly accept GNN orchestration commands
     p.add_argument("--prediction-level", type=str, default="image", help="Ignored. ConvNeXt is purely image-level.")
-    p.add_argument("--demographic-columns", nargs="*", default=None, help="Ignored. ConvNeXt does not use tabular demographics.")
+    p.add_argument("--demographic-columns", nargs="*", default=["patient_age", "patient_sex", "exam_eye"], help="Context variables for FiLM.")
     
     p.add_argument("--image-size", type=int, default=384)
     p.add_argument("--epochs", type=int, default=50)
@@ -134,6 +135,7 @@ def main() -> None:
         data=prepared_dir / args.train_manifest,
         image_dir=root / "fundus_photos",
         target_cols=label_columns,
+        demo_cols=args.demographic_columns,
         transform=train_transform,
         validate_paths=True
     )
@@ -142,6 +144,7 @@ def main() -> None:
         data=prepared_dir / args.validation_manifest,
         image_dir=root / "fundus_photos",
         target_cols=label_columns,
+        demo_cols=args.demographic_columns,
         transform=val_transform,
         validate_paths=False
     )
@@ -155,19 +158,18 @@ def main() -> None:
     neg_counts = np.maximum(train_targets.shape[0] - pos_counts, 1.0)
     adaptive_biases = np.log(pos_counts / neg_counts).astype(np.float32)
 
+    print(f"\nStarting FiLM CONVNEXT hyperparameter tuning over {args.num_trials} trials...")
+
     # 5. Hyperparameter Tuning Loop
-    head_lrs = [1e-4, 5e-4, 1e-3]
-    actual_trials = min(args.num_trials, len(head_lrs))
-    print(f"\nStarting CONVNEXT hyperparameter tuning over {actual_trials} trials...")
-
-    for trial in range(1, actual_trials + 1):
-        batch_size = 32
+    for trial in range(1, args.num_trials + 1):
+        batch_size = random.choice([32, 64])
         backbone_lr = 1e-5
-        head_lr = head_lrs[trial - 1]
-        dropout = 0.0
+        head_lr = random.choice([1e-4, 5e-4, 1e-3])
+        dropout = random.uniform(0.15, 0.4)
+        context_dropout = random.uniform(0.0, 0.25)
 
-        print(f"\n=== [TRIAL {trial}/{actual_trials}] ===")
-        print(f"Parameters: drop={dropout:.4f}, batch={batch_size}, bb_lr={backbone_lr}, head_lr={head_lr}")
+        print(f"\n=== [TRIAL {trial}/{args.num_trials}] ===")
+        print(f"Parameters: drop={dropout:.4f}, cdrop={context_dropout:.4f}, batch={batch_size}, bb_lr={backbone_lr}, head_lr={head_lr}")
 
         train_loader = create_dataloader(
             dataset=train_dataset, batch_size=batch_size, shuffle=True, 
@@ -180,17 +182,13 @@ def main() -> None:
             seed=args.seed, is_graph=False
         )
 
-        model = timm.create_model("convnextv2_tiny", pretrained=True, num_classes=len(label_columns), drop_rate=dropout)
-        
-        # Apply initial biases to the classification head
-        with torch.no_grad():
-            if hasattr(model, 'head') and hasattr(model.head, 'fc'):
-                model.head.fc.bias.copy_(torch.from_numpy(adaptive_biases))
-            elif hasattr(model, 'head'):
-                if hasattr(model.head, 'bias') and model.head.bias is not None:
-                    model.head.bias.copy_(torch.from_numpy(adaptive_biases))
-        
-        model = model.to(device)
+        model = ContextFiLMConvNeXt(
+            num_labels=len(label_columns),
+            num_contexts=len(args.demographic_columns) if args.demographic_columns else 0,
+            initial_biases=adaptive_biases,
+            dropout=dropout,
+            context_dropout=context_dropout
+        ).to(device)
 
         criterion = AsymmetricLossOptimized(gamma_neg=4, gamma_pos=1, clip=0.05)
         criterion.pos_weight = pos_weight
@@ -199,10 +197,10 @@ def main() -> None:
         backbone_params = []
         head_params = []
         for name, param in model.named_parameters():
-            if "head" in name:
-                head_params.append(param)
-            else:
+            if "backbone" in name:
                 backbone_params.append(param)
+            else:
+                head_params.append(param)
                 
         optimizer = torch.optim.AdamW([
             {"params": backbone_params, "lr": backbone_lr},
@@ -212,14 +210,14 @@ def main() -> None:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         
         scaler = make_grad_scaler(amp_enabled)
-
-        run_name_suffix = f"drop{dropout:.2f}_batch{batch_size}_bb{backbone_lr}_head{head_lr}"
+        
+        run_name_suffix = f"drop{dropout:.2f}_cdrop{context_dropout:.2f}_batch{batch_size}_bb{backbone_lr}_head{head_lr}"
         run_dir = output_dir / f"trial_{trial}_{run_name_suffix}"
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = run_dir / "final_checkpoint.pt"
         
         trial_config = {
-            "trial": trial, "model": "convnextv2_tiny", "dropout": dropout,
+            "trial": trial, "model": "convnextv2_tiny", "dropout": dropout, "context_dropout": context_dropout,
             "batch_size": batch_size, "backbone_lr": backbone_lr, "head_lr": head_lr, "seed": args.seed,
         }
         write_json(run_dir / "run_config.json", trial_config)

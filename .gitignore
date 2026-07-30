@@ -16,5 +16,10 @@
 !tune_gnn.py
 
 !tune_convnext.py
+!tune_population_gnn.py
+!tune_film.py
+
+!models/
+!models/**
 
 **/__pycache__/**
