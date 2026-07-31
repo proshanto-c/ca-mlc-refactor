@@ -267,7 +267,10 @@ def main() -> None:
                 "val_micro_f1_static": val_res["summary"]["micro_f1"],
                 "val_macro_f1_calibrated": epoch_calibrated_f1,
                 "val_micro_f1_calibrated": epoch_calibrated_micro_f1,
-                "val_macro_auroc": val_res["summary"]["macro_auroc"]
+                "val_macro_auroc": val_res["summary"]["macro_auroc"],
+                "val_macro_auprc": val_res["summary"]["macro_auprc"],
+                "val_macro_precision": val_res["summary"]["macro_precision"],
+                "val_macro_recall": val_res["summary"]["macro_recall"]
             })
             pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
 
@@ -282,6 +285,9 @@ def main() -> None:
                     "val/macro_f1_calibrated": epoch_calibrated_f1,
                     "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
                     "val/macro_auroc": val_res["summary"]["macro_auroc"],
+                    "val/macro_auprc": val_res["summary"]["macro_auprc"],
+                    "val/macro_precision": val_res["summary"]["macro_precision"],
+                    "val/macro_recall": val_res["summary"]["macro_recall"],
                 }
 
                 # Add per-label metrics
@@ -290,10 +296,16 @@ def main() -> None:
                     wandb_log_dict[f"val_calibrated_f1/{lbl}"] = row['validation_f1']
                     wandb_log_dict[f"val_optimal_threshold/{lbl}"] = row['optimal_threshold']
                     wandb_log_dict[f"val_balanced_acc/{lbl}"] = row['validation_balanced_accuracy']
+                    wandb_log_dict[f"val_calibrated_acc/{lbl}"] = row['validation_accuracy']
 
                 for _, row in val_res["metrics_frame"].iterrows():
                     lbl = row['label']
                     wandb_log_dict[f"val_auroc/{lbl}"] = row['auroc']
+                    wandb_log_dict[f"val_auprc/{lbl}"] = row['auprc']
+                    wandb_log_dict[f"val_static_f1/{lbl}"] = row['f1']
+                    wandb_log_dict[f"val_static_acc/{lbl}"] = row['accuracy']
+                    wandb_log_dict[f"val_static_precision/{lbl}"] = row['precision']
+                    wandb_log_dict[f"val_static_recall/{lbl}"] = row['recall']
 
                 wandb_run.log(wandb_log_dict)
 
