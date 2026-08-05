@@ -19,6 +19,7 @@
 !tune_population_gnn.py
 !tune_film.py
 !tune_all.py
+!submit_tuning.sh
 
 !models/
 !models/**
