@@ -43,7 +43,7 @@ from utils.data_functions import calculate_positive_weights, create_dataloader
 from utils.train_functions import graph_epoch
 from utils.metrics import save_predictions
 from utils.logger import start_wandb_run, finish_wandb_run
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 
 # =====================================================================
 # 1. METADATA & DEMOGRAPHICS CONFIGURATION
@@ -278,10 +278,10 @@ def main() -> None:
 
         # Tuning Loop
         for trial in range(1, args.num_trials + 1):
-            h_dim = random.choice([32, 64, 128, 256])
-            n_layers = random.choice([3, 4, 5])
+            h_dim = random.choice([32, 64, 128])
+            n_layers = random.choice([2, 3, 4])
             dropout = random.uniform(0.1, 0.35)
-            batch_size = random.choice([32, 64])
+            batch_size = 128
             learning_rate = random.choice([1e-4, 5e-4, 1e-3])
 
             print(f"\n--- {exp['name']} | TRIAL {trial}/{args.num_trials} ---")
@@ -361,7 +361,8 @@ def main() -> None:
                     "val_micro_f1_static": val_res["summary"]["micro_f1"],
                     "val_macro_f1_calibrated": epoch_calibrated_f1,
                     "val_micro_f1_calibrated": epoch_calibrated_micro_f1,
-                    "val_macro_auroc": val_res["summary"]["macro_auroc"]
+                    "val_macro_auroc": val_res["summary"]["macro_auroc"],
+		    "val_macro_auprc": val_res["summary"]["macro_auprc"]
                 })
                 pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
 
@@ -378,6 +379,7 @@ def main() -> None:
                         "val/macro_f1_calibrated": epoch_calibrated_f1,
                         "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
                         "val/macro_auroc": val_res["summary"]["macro_auroc"],
+			"val/macro_auprc": val_res["summary"]["macro_auprc"],
                         "val/macro_accuracy_calibrated": epoch_threshold_df["validation_accuracy"].mean(),
                         "val/macro_balanced_acc_calibrated": epoch_threshold_df["validation_balanced_accuracy"].mean(),
                     }
@@ -388,8 +390,12 @@ def main() -> None:
                         try:
                             auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
                         except ValueError:
-                            auroc = 0.0 
+                            auroc = 0.0
                         
+                        try:
+                            auprc = average_precision_score(y_true[:, idx], y_prob[:, idx])
+                        except ValueError:
+                            auprc = 0.0
                         uncalib_f1_normal = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="binary", zero_division=0)
                         uncalib_f1_macro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="macro", zero_division=0)
                         uncalib_f1_micro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="micro", zero_division=0)
@@ -399,6 +405,7 @@ def main() -> None:
                         calib_f1_micro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="micro", zero_division=0)
                         
                         log_dict[f"val_auroc_per_class/{label}"] = auroc
+			log_dict[f"val_auprc_per_class/{label}"] = auprc
                         log_dict[f"val_optimal_threshold/{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
                         
                         log_dict[f"val_calibrated_f1_per_class/{label}"] = calib_f1_normal
