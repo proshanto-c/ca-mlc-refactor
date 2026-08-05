@@ -18,6 +18,7 @@
 !tune_convnext.py
 !tune_population_gnn.py
 !tune_film.py
+!tune_all.py
 
 !models/
 !models/**

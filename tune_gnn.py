@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import random
+import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -10,6 +12,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import re
+from collections import Counter
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
@@ -17,6 +21,14 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+# --- SUPPRESS TERMINAL WARNINGS ---
+# 1. Disable the HuggingFace Symlinks warning for Windows
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+# 2. Suppress the PyG C++ extension import warnings (which spam every dataloader worker)
+warnings.filterwarnings("ignore", message=".*An issue occurred while importing 'torch-scatter'.*")
+warnings.filterwarnings("ignore", message=".*An issue occurred while importing 'torch-sparse'.*")
 
 # --- MODULAR IMPORTS ---
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
@@ -47,7 +59,7 @@ DEFAULT_LABEL_CANDIDATES = [
 
 DEFAULT_DEMOGRAPHIC_CANDIDATES = [
     "patient_age", "age", "patient_sex", "sex", 
-    # "diabetes_time", "diabetes_duration", "insulin_use", "comorbidities", "nationality", 
+    "diabetes_time_y", "insuline",
     "exam_eye",
 ]
 
@@ -108,8 +120,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--label-columns", nargs="*", default=None)
     p.add_argument("--demographic-columns", nargs="*", default=None)
-    p.add_argument("--image-size", type=int, default=256)
-    p.add_argument("--patch-size", type=int, default=32)
+    p.add_argument("--image-size", type=int, default=512)
+    p.add_argument("--patch-size", type=int, default=16)
     p.add_argument("--connectivity", type=int, default=4, choices=[4, 8])
     p.add_argument("--epochs", type=int, default=50)
     # p.add_argument("--learning-rate", type=float, default=1e-4)
@@ -117,6 +129,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--no-amp", action="store_true")
+    p.add_argument("--no-context", action="store_true", help="If passed, model runs in image-only baseline mode without contextual edges.")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--monitor", choices=["val_loss", "val_macro_f1"], default="val_loss")
     p.add_argument("--num-workers", type=int, default=12)
@@ -131,6 +144,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
     return p.parse_args()
+
+
+def preprocess_comorbidities(df: pd.DataFrame, valid_comorb: Optional[List[str]] = None, top_k: int = 20):
+    if "comorbidities" not in df.columns:
+        return df, []
+        
+    df = df.copy()
+    
+    if valid_comorb is None:
+        all_conditions = []
+        raw = df["comorbidities"].dropna().astype(str).tolist()
+        for c in raw:
+            parts = re.split(r',|\sand\s', c.lower())
+            for p in parts:
+                p = p.strip()
+                if p and p != '0':
+                    all_conditions.append(p)
+        counts = Counter(all_conditions)
+        valid_comorb = [item[0] for item in counts.most_common(top_k)]
+        
+    for condition in valid_comorb:
+        col_name = f"comorbidity_{condition.replace(' ', '_')}"
+        def has_condition(val):
+            if pd.isna(val): return 0.0
+            parts = [p.strip() for p in re.split(r',|\sand\s', str(val).lower())]
+            return 1.0 if condition in parts else 0.0
+        df[col_name] = df["comorbidities"].apply(has_condition)
+        
+    return df, valid_comorb
+
 
 
 # =====================================================================
@@ -150,8 +193,16 @@ def main() -> None:
     print_runtime(device)
     amp_enabled = device.type == "cuda" and not args.no_amp
 
-    # 2. Metadata Extraction
+    # 2. Metadata Extraction & Preprocessing
     train_frame = pd.read_csv(prepared_dir / args.train_manifest)
+    val_frame = pd.read_csv(prepared_dir / args.validation_manifest)
+    
+    train_frame, top_comorb = preprocess_comorbidities(train_frame, top_k=20)
+    val_frame, _ = preprocess_comorbidities(val_frame, valid_comorb=top_comorb)
+    
+    dynamic_comorb_cols = [f"comorbidity_{c.replace(' ', '_')}" for c in top_comorb]
+    DEFAULT_DEMOGRAPHIC_CANDIDATES.extend(dynamic_comorb_cols)
+    
     label_columns = infer_label_columns(train_frame, args.label_columns)
     demo_columns = infer_demographic_columns(train_frame, args.demographic_columns, label_columns)
     demo_specs = fit_demographic_specs(train_frame, demo_columns)
@@ -161,14 +212,12 @@ def main() -> None:
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
         transforms.RandomRotation(degrees=15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.ToTensor()
     ])
 
     val_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.ToTensor()
     ])
 
     # 3. Instantiate Modular Datasets (Memory-Loaded)
@@ -184,14 +233,14 @@ def main() -> None:
     }
 
     train_dataset = BRSETGraphDataset(
-        data=prepared_dir / args.train_manifest,
+        data=train_frame,
         validate_paths=True,
         transform=train_transform,
         **dataset_kwargs
     )
     
     val_dataset = BRSETGraphDataset(
-        data=prepared_dir / args.validation_manifest,
+        data=val_frame,
         validate_paths=False,
         transform=val_transform,
         **dataset_kwargs
@@ -236,7 +285,8 @@ def main() -> None:
         model = PatientGraphModel(
             num_labels=len(label_columns), demographic_specs=demo_specs,
             hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
-            prediction_level=args.prediction_level, initial_biases=adaptive_biases
+            prediction_level=args.prediction_level, initial_biases=adaptive_biases,
+            use_context=not args.no_context
         ).to(device)
 
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -310,8 +360,8 @@ def main() -> None:
                     "epoch": epoch,
                     "train/loss": train_res["loss"],
                     "val/loss": val_res["loss"],
-                    "val/macro_f1_static": val_res["summary"]["macro_f1"],
-                    "val/micro_f1_static": val_res["summary"]["micro_f1"],
+                    "val/macro_f1_uncalibrated": val_res["summary"]["macro_f1"],
+                    "val/micro_f1_uncalibrated": val_res["summary"]["micro_f1"],
                     "val/macro_f1_calibrated": epoch_calibrated_f1,
                     "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
                     "val/macro_auroc": val_res["summary"]["macro_auroc"],
@@ -321,15 +371,32 @@ def main() -> None:
                 }
 
                 # Dynamically log per-class metrics
+                uncalibrated_preds = (y_prob >= 0.5).astype(int)
+                calibrated_preds = (y_prob >= best_thresholds.reshape(1, -1)).astype(int)
                 for idx, label in enumerate(label_columns):
                     try:
                         auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
                     except ValueError:
                         auroc = 0.0 
                     
+                    uncalib_f1_normal = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="binary", zero_division=0)
+                    uncalib_f1_macro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="macro", zero_division=0)
+                    uncalib_f1_micro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="micro", zero_division=0)
+                    
+                    calib_f1_normal = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="binary", zero_division=0)
+                    calib_f1_macro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="macro", zero_division=0)
+                    calib_f1_micro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="micro", zero_division=0)
+                    
                     log_dict[f"val_auroc_per_class/{label}"] = auroc
                     log_dict[f"val_optimal_threshold/{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
-                    log_dict[f"val_calibrated_f1_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_f1"]
+                    
+                    log_dict[f"val_calibrated_f1_per_class/{label}"] = calib_f1_normal
+                    log_dict[f"val_calibrated_f1_macro_per_class/{label}"] = calib_f1_macro
+                    log_dict[f"val_calibrated_f1_micro_per_class/{label}"] = calib_f1_micro
+                    
+                    log_dict[f"val_uncalibrated_f1_per_class/{label}"] = uncalib_f1_normal
+                    log_dict[f"val_uncalibrated_f1_macro_per_class/{label}"] = uncalib_f1_macro
+                    log_dict[f"val_uncalibrated_f1_micro_per_class/{label}"] = uncalib_f1_micro
                     
                     # --- NEW: Log the perfectly calibrated Accuracies per disease ---
                     log_dict[f"val_accuracy_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_accuracy"]
