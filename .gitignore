@@ -23,4 +23,6 @@
 !models/
 !models/**
 
+!environment.yml
+
 **/__pycache__/**
