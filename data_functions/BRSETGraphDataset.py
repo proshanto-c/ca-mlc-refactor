@@ -137,9 +137,9 @@ class BRSETGraphDataset(Dataset):
                 eye_ids = []
                 
                 for _, row in group.iterrows():
-                    raw_path = row.get("image_path", f"fundus_photos/{row['image_id']}.jpg")
+                    raw_path = row.get("image_path", f"{row['image_id']}.jpg")
                     p = Path(raw_path)
-                    p = p if p.is_absolute() else self.image_dir / p
+                    p = p if p.is_absolute() else self.image_dir / p.name
                     
                     if validate and not p.is_file():
                         raise FileNotFoundError(f"Missing image: {p}")
@@ -162,9 +162,9 @@ class BRSETGraphDataset(Dataset):
         else:
             # --- BATCH BY IMAGE ---
             for _, row in self.frame.iterrows():
-                raw_path = row.get("image_path", f"fundus_photos/{row['image_id']}.jpg")
+                raw_path = row.get("image_path", f"{row['image_id']}.jpg")
                 p = Path(raw_path)
-                p = p if p.is_absolute() else self.image_dir / p
+                p = p if p.is_absolute() else self.image_dir / p.name
                 
                 if validate and not p.is_file():
                     raise FileNotFoundError(f"Missing image: {p}")

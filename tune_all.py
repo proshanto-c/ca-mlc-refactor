@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=16)
     p.add_argument("--connectivity", type=int, default=4, choices=[4, 8])
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--seed", type=int, default=12)
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--deterministic", action="store_true")
@@ -146,7 +146,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--monitor", choices=["val_loss", "val_macro_f1"], default="val_loss")
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--num-trials", type=int, default=10, help="Number of random search trials per model config.")
+    p.add_argument("--num-trials", type=int, default=1, help="Number of random search trials per model config.")
 
     # Splitting Arguments
     p.add_argument("--split-total", type=int, default=1, help="Total number of parallel jobs (e.g. 2).")
@@ -278,13 +278,13 @@ def main() -> None:
 
         # Tuning Loop
         for trial in range(1, args.num_trials + 1):
-            h_dim = random.choice([32, 64, 128, 256])
-            n_layers = random.choice([3, 4, 5])
-            dropout = random.uniform(0.1, 0.35)
-            batch_size = random.choice([64, 128, 256])
-            learning_rate = random.choice([1e-4, 5e-4, 1e-3])
+            h_dim = 32
+            n_layers = 3
+            dropout = 0.25
+            batch_size = 128
+            learning_rate = 1e-4
 
-            print(f"\n--- {exp['name']} | TRIAL {trial}/{args.num_trials} ---")
+            print(f"\n--- {exp['name']} | FINAL TRAINING ---")
             print(f"Params: h_dim={h_dim}, n_layers={n_layers}, drop={dropout:.4f}, batch={batch_size}, lr={learning_rate}")
 
             train_loader = create_dataloader(
@@ -335,84 +335,96 @@ def main() -> None:
                     amp_enabled=amp_enabled, label_columns=label_columns, optimizer=optimizer, 
                     scaler=scaler, desc=f"[{exp['name']} T{trial}] E{epoch:02d} Train", threshold=args.threshold
                 )
-                
-                val_res = graph_epoch(
-                    model=model, loader=val_loader, criterion=criterion, device=device, 
-                    amp_enabled=amp_enabled, label_columns=label_columns, optimizer=None, 
-                    scaler=None, desc=f"[{exp['name']} T{trial}] E{epoch:02d} Val", threshold=args.threshold
-                )
-
-                best_thresholds, epoch_threshold_df = find_optimal_thresholds(
-                    targets=val_res["targets"],
-                    probabilities=val_res["probabilities"],
-                    label_names=label_columns,
-                    step=0.05 
-                )
-                epoch_calibrated_f1 = epoch_threshold_df["validation_f1"].mean()
-                
-                calibrated_predictions = (val_res["probabilities"] >= best_thresholds.reshape(1, -1)).astype(int)
-                epoch_calibrated_micro_f1 = f1_score(val_res["targets"], calibrated_predictions, average="micro", zero_division=0)
-
-                history.append({
-                    "epoch": epoch,
-                    "train_loss": train_res["loss"],
-                    "val_loss": val_res["loss"],
-                    "val_macro_f1_static": val_res["summary"]["macro_f1"],
-                    "val_micro_f1_static": val_res["summary"]["micro_f1"],
-                    "val_macro_f1_calibrated": epoch_calibrated_f1,
-                    "val_micro_f1_calibrated": epoch_calibrated_micro_f1,
-                    "val_macro_auroc": val_res["summary"]["macro_auroc"]
-                })
-                pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
-
                 if wandb_run is not None:
-                    y_true = val_res["targets"]
-                    y_prob = val_res["probabilities"]
+                    wandb.log({"epoch": epoch, "train/loss": train_res["loss"]}, step=epoch)
+            
+            # --- FINAL VALIDATION AFTER ALL EPOCHS ---
+            epoch = args.epochs
+            val_res = graph_epoch(
+                model=model, loader=val_loader, criterion=criterion, device=device, 
+                amp_enabled=amp_enabled, label_columns=label_columns, optimizer=None, 
+                scaler=None, desc=f"[{exp['name']} T{trial}] E{epoch:02d} Val", threshold=args.threshold
+            )
+
+            best_thresholds, epoch_threshold_df = find_optimal_thresholds(
+                targets=val_res["targets"],
+                probabilities=val_res["probabilities"],
+                label_names=label_columns,
+                step=0.05 
+            )
+            epoch_calibrated_f1 = epoch_threshold_df["validation_f1"].mean()
+            
+            calibrated_predictions = (val_res["probabilities"] >= best_thresholds.reshape(1, -1)).astype(int)
+            epoch_calibrated_micro_f1 = f1_score(val_res["targets"], calibrated_predictions, average="micro", zero_division=0)
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": train_res["loss"],
+                "val_loss": val_res["loss"],
+                "val_macro_f1_static": val_res["summary"]["macro_f1"],
+                "val_micro_f1_static": val_res["summary"]["micro_f1"],
+                "val_macro_f1_calibrated": epoch_calibrated_f1,
+                "val_micro_f1_calibrated": epoch_calibrated_micro_f1,
+                "val_macro_auroc": val_res["summary"]["macro_auroc"],
+                "val_macro_auprc": val_res["summary"]["macro_auprc"]
+            })
+            pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
+
+            if wandb_run is not None:
+                y_true = val_res["targets"]
+                y_prob = val_res["probabilities"]
+                
+                log_dict = {
+                    "epoch": epoch,
+                    "train/loss": train_res["loss"],
+                    "val/loss": val_res["loss"],
+                    "val/macro_f1_uncalibrated": val_res["summary"]["macro_f1"],
+                    "val/micro_f1_uncalibrated": val_res["summary"]["micro_f1"],
+                    "val/macro_f1_calibrated": epoch_calibrated_f1,
+                    "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
+                    "val/macro_auroc": val_res["summary"]["macro_auroc"],
+                    "val/macro_auprc": val_res["summary"]["macro_auprc"],
+                    "val/macro_accuracy_calibrated": epoch_threshold_df["validation_accuracy"].mean(),
+                    "val/macro_balanced_acc_calibrated": epoch_threshold_df["validation_balanced_accuracy"].mean(),
+                }
+
+                uncalibrated_preds = (y_prob >= 0.5).astype(int)
+                calibrated_preds = (y_prob >= best_thresholds.reshape(1, -1)).astype(int)
+                for idx, label in enumerate(label_columns):
+                    try:
+                        auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
+                    except ValueError:
+                        auroc = 0.0 
                     
-                    log_dict = {
-                        "epoch": epoch,
-                        "train/loss": train_res["loss"],
-                        "val/loss": val_res["loss"],
-                        "val/macro_f1_uncalibrated": val_res["summary"]["macro_f1"],
-                        "val/micro_f1_uncalibrated": val_res["summary"]["micro_f1"],
-                        "val/macro_f1_calibrated": epoch_calibrated_f1,
-                        "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
-                        "val/macro_auroc": val_res["summary"]["macro_auroc"],
-                        "val/macro_accuracy_calibrated": epoch_threshold_df["validation_accuracy"].mean(),
-                        "val/macro_balanced_acc_calibrated": epoch_threshold_df["validation_balanced_accuracy"].mean(),
-                    }
+                    try:
+                        auprc = average_precision_score(y_true[:, idx], y_prob[:, idx])
+                    except ValueError:
+                        auprc = 0.0
+                    
+                    uncalib_f1_normal = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="binary", zero_division=0)
+                    uncalib_f1_macro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="macro", zero_division=0)
+                    uncalib_f1_micro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="micro", zero_division=0)
+                    
+                    calib_f1_normal = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="binary", zero_division=0)
+                    calib_f1_macro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="macro", zero_division=0)
+                    calib_f1_micro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="micro", zero_division=0)
+                    
+                    log_dict[f"val_auroc_per_class/{label}"] = auroc
+                    log_dict[f"val_auprc_per_class/{label}"] = auprc
+                    log_dict[f"val_optimal_threshold/{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
+                    
+                    log_dict[f"val_calibrated_f1_per_class/{label}"] = calib_f1_normal
+                    log_dict[f"val_calibrated_f1_macro_per_class/{label}"] = calib_f1_macro
+                    log_dict[f"val_calibrated_f1_micro_per_class/{label}"] = calib_f1_micro
+                    
+                    log_dict[f"val_uncalibrated_f1_per_class/{label}"] = uncalib_f1_normal
+                    log_dict[f"val_uncalibrated_f1_macro_per_class/{label}"] = uncalib_f1_macro
+                    log_dict[f"val_uncalibrated_f1_micro_per_class/{label}"] = uncalib_f1_micro
+                    
+                    log_dict[f"val_accuracy_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_accuracy"]
+                    log_dict[f"val_balanced_acc_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_balanced_accuracy"]
 
-                    uncalibrated_preds = (y_prob >= 0.5).astype(int)
-                    calibrated_preds = (y_prob >= best_thresholds.reshape(1, -1)).astype(int)
-                    for idx, label in enumerate(label_columns):
-                        try:
-                            auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
-                        except ValueError:
-                            auroc = 0.0 
-                        
-                        uncalib_f1_normal = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="binary", zero_division=0)
-                        uncalib_f1_macro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="macro", zero_division=0)
-                        uncalib_f1_micro = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="micro", zero_division=0)
-                        
-                        calib_f1_normal = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="binary", zero_division=0)
-                        calib_f1_macro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="macro", zero_division=0)
-                        calib_f1_micro = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="micro", zero_division=0)
-                        
-                        log_dict[f"val_auroc_per_class/{label}"] = auroc
-                        log_dict[f"val_optimal_threshold/{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
-                        
-                        log_dict[f"val_calibrated_f1_per_class/{label}"] = calib_f1_normal
-                        log_dict[f"val_calibrated_f1_macro_per_class/{label}"] = calib_f1_macro
-                        log_dict[f"val_calibrated_f1_micro_per_class/{label}"] = calib_f1_micro
-                        
-                        log_dict[f"val_uncalibrated_f1_per_class/{label}"] = uncalib_f1_normal
-                        log_dict[f"val_uncalibrated_f1_macro_per_class/{label}"] = uncalib_f1_macro
-                        log_dict[f"val_uncalibrated_f1_micro_per_class/{label}"] = uncalib_f1_micro
-                        
-                        log_dict[f"val_accuracy_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_accuracy"]
-                        log_dict[f"val_balanced_acc_per_class/{label}"] = epoch_threshold_df.iloc[idx]["validation_balanced_accuracy"]
-
-                    wandb.log(log_dict, step=epoch)
+                wandb.log(log_dict, step=epoch)
 
             torch.save({"model_state_dict": model.state_dict(), "hyperparams": trial_config}, checkpoint_path)
 
