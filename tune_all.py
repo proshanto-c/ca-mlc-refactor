@@ -7,7 +7,7 @@ import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
-
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -387,7 +387,8 @@ def main() -> None:
                 }
                 
                 checkpoint_data = {
-                    "model_state_dict": model.state_dict(),
+                    # Strip the 1.2GB frozen RETFound ViT backbone from the saved weights!
+                    "model_state_dict": {k: v for k, v in model.state_dict().items() if not k.startswith("cnn.")},
                     "hyperparams": trial_config,
                     "epoch": epoch
                 }
