@@ -1,13 +1,11 @@
 #!/bin/bash
-#SBATCH --partition=a100            # Using a100 partition (2 day limit, 4 GPUs per user)
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4           # Request 4 CPU cores for dataloading
 #SBATCH --mem=32G                   # Request 32GB total memory
 #SBATCH --gres=gpu:1                # Request 1 GPU
-#SBATCH --time=47:59:00             # Max time limit for a100 partition
+#SBATCH --time=47:59:00             # Max time limit
 #SBATCH --job-name=camlc_tuning
-#SBATCH --array=0-38                # Create 39 identical jobs (will run 4 at a time based on quota)
 #SBATCH --output=logs/tune_%A_%a.out
 #SBATCH --error=logs/tune_%A_%a.err
 
@@ -25,7 +23,7 @@ mkdir -p logs
 # We split the 39 model variations across 39 parallel jobs! 
 # Each job gets its own unique SLURM_ARRAY_TASK_ID (0 to 38)
 python tune_all.py \
-    --root "/users/sann7128/data/BRSET" \
-    --split-total 39 \
+    --root "/users/sann7128/ca-mlc-refactor/data/BRSET" \
+    --split-total 27 \
     --split-index $SLURM_ARRAY_TASK_ID \
-    --num-trials 7
+    --num-trials 1
