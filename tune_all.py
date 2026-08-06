@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=16)
-    p.add_argument("--connectivity", type=int, default=4, choices=[4, 8])
+    p.add_argument("--connectivity", type=int, default=8, choices=[4, 8])
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--seed", type=int, default=12)
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split-index", type=int, default=0, help="The 0-indexed chunk to run (e.g. 0 or 1).")
 
     # W&B Arguments
-    p.add_argument("--wandb-project", type=str, default="GNN-Tuning-39-Models")
+    p.add_argument("--wandb-project", type=str, default="GNN-Tuning-27-Models")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-run-name-prefix", type=str, default="tune")
     p.add_argument("--wandb-group", type=str, default=None)
@@ -281,7 +281,7 @@ def main() -> None:
             h_dim = 32
             n_layers = 3
             dropout = 0.25
-            batch_size = 128
+            batch_size = 32
             learning_rate = 1e-4
 
             print(f"\n--- {exp['name']} | FINAL TRAINING ---")

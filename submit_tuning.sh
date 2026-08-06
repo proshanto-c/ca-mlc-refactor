@@ -11,10 +11,10 @@
 
 # 1. Setup the environment (Uncomment the one you are using)
 # If using Miniconda:
-# source ~/miniconda3/bin/activate brset-camlc
+source ~/miniconda/bin/activate brset-camlc
 
 # If using Python Venv:
-source ~/ca-mlc-refactor/brset-camlc/bin/activate
+# source ~/ca-mlc-refactor/brset-camlc/bin/activate
 
 # 2. Make sure the logs directory exists
 mkdir -p logs
