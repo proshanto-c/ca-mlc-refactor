@@ -428,7 +428,9 @@ def main() -> None:
                     uncalibrated_preds = (y_prob >= 0.5).astype(int)
                     calibrated_preds = (y_prob >= best_thresholds.reshape(1, -1)).astype(int)
                     for idx, label in enumerate(label_columns):
-                        prefix = f"{idx+1:02d}_"
+                        # Use the global index from ALL_LABELS so the prefix is identical across all models
+                        global_idx = ALL_LABELS.index(label)
+                        prefix = f"{global_idx+1:02d}_"
                         try:
                             auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
                         except ValueError:
