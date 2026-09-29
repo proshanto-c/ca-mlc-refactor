@@ -275,8 +275,8 @@ class PatientGraphModel(nn.Module):
                 expected_patches = (imgs.shape[2] // 16) * (imgs.shape[3] // 16)
                 if features.shape[1] > expected_patches:
                     # Extract the global CLS token and inject it into the Image Node!
-                    cls_token = features[:, 0, :]
-                    x_dict["image"] = x_dict["image"] + self.cls_encoder(cls_token)
+                    # cls_token = features[:, 0, :]
+                    # x_dict["image"] = x_dict["image"] + self.cls_encoder(cls_token)
                     
                     # Drop the CLS token for the patches
                     patch_features_seq = features[:, 1:, :] 

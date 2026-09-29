@@ -273,6 +273,11 @@ def main() -> None:
         neg_counts = np.maximum(train_targets.shape[0] - pos_counts, 1.0)
         adaptive_biases = np.log(pos_counts / neg_counts).astype(np.float32)
         
+        # --- Inter-Label Distribution Weights ---
+        max_pos = float(pos_counts.max())
+        class_weights = np.sqrt(max_pos / pos_counts).astype(np.float32)
+        class_weights = torch.tensor(class_weights, device=device)
+        
         config_dir = output_dir / exp["name"]
         config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -306,7 +311,7 @@ def main() -> None:
                 use_image_features=not exp.get("no_image", False)
             ).to(device)
 
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            criterion = nn.BCEWithLogitsLoss(weight=class_weights, pos_weight=pos_weight)
             optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
             scaler = make_grad_scaler(amp_enabled)
             # Linear warm-up from 1% of base LR up to 100% over the first 10% of epochs
