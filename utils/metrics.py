@@ -89,28 +89,64 @@ def find_optimal_thresholds(
         candidates = np.percentile(y_score, percentiles)
         candidates = np.unique(np.clip(candidates, 0.001, 0.999))
         
-        best_threshold = 0.5
-        best_f1 = -1.0
+        is_multilabel = len(label_names) > 1
+        
+        best_f1_threshold = 0.5
+        best_f1_val = -1.0
+        
+        best_youden_threshold = 0.5
+        best_youden_val = -1.0
         
         for threshold in candidates:
             prediction = (y_score >= threshold).astype(np.int8)
-            score = safe_metric(f1_score, y_true, prediction, zero_division=0, default=0.0)
-            if score > best_f1:
-                best_f1 = score
-                best_threshold = float(threshold)
+            
+            # 1. Track F1 Optimization
+            f1 = safe_metric(f1_score, y_true, prediction, zero_division=0, default=0.0)
+            if f1 > best_f1_val:
+                best_f1_val = f1
+                best_f1_threshold = float(threshold)
                 
-        # --- Calculate Accuracy metrics using the winning threshold ---
-        best_prediction = (y_score >= best_threshold).astype(np.int8)
-        best_acc = safe_metric(accuracy_score, y_true, best_prediction, default=0.0)
-        best_bal_acc = safe_metric(balanced_accuracy_score, y_true, best_prediction, default=0.0)
+            # 2. Track Youden Optimization (if multilabel)
+            if is_multilabel:
+                try:
+                    tn, fp, fn, tp = confusion_matrix(y_true, prediction, labels=[0, 1]).ravel()
+                    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                    j_stat = sens + spec - 1.0
+                except Exception:
+                    j_stat = -1.0
+                    
+                if j_stat > best_youden_val:
+                    best_youden_val = j_stat
+                    best_youden_threshold = float(threshold)
+                    
+        # The "primary" optimal threshold is Youden for multilabel, F1 for single-label
+        best_primary_threshold = best_youden_threshold if is_multilabel else best_f1_threshold
                 
-        best_thresholds.append(best_threshold)
+        # --- Calculate Accuracy metrics using the primary winning threshold ---
+        primary_prediction = (y_score >= best_primary_threshold).astype(np.int8)
+        primary_acc = safe_metric(accuracy_score, y_true, primary_prediction, default=0.0)
+        primary_bal_acc = safe_metric(balanced_accuracy_score, y_true, primary_prediction, default=0.0)
+        primary_f1_final = safe_metric(f1_score, y_true, primary_prediction, zero_division=0, default=0.0)
+        
+        # Calculate F1 using the Youden threshold explicitly
+        if is_multilabel:
+            youden_prediction = (y_score >= best_youden_threshold).astype(np.int8)
+            youden_f1 = safe_metric(f1_score, y_true, youden_prediction, zero_division=0, default=0.0)
+        else:
+            youden_f1 = math.nan
+                
+        best_thresholds.append(best_primary_threshold)
         rows.append({
             "label": label,
-            "optimal_threshold": best_threshold,
-            "validation_f1": best_f1,
-            "validation_accuracy": best_acc, 
-            "validation_balanced_accuracy": best_bal_acc, 
+            "optimal_threshold": best_primary_threshold,
+            "optimal_f1_threshold": best_f1_threshold,
+            "optimal_youden_threshold": best_youden_threshold if is_multilabel else math.nan,
+            "validation_f1": primary_f1_final,           # F1 score using primary threshold
+            "validation_f1_at_f1_thresh": best_f1_val,   # F1 score using F1-optimized threshold
+            "validation_f1_at_youden_thresh": youden_f1, # F1 score using Youden-optimized threshold
+            "validation_accuracy": primary_acc, 
+            "validation_balanced_accuracy": primary_bal_acc, 
         })
 
     return np.asarray(best_thresholds, dtype=np.float32), pd.DataFrame(rows)
@@ -158,6 +194,7 @@ def evaluate_multilabel_predictions(
             "recall": safe_metric(recall_score, y_true, y_pred, zero_division=0),
             "sensitivity": sensitivity,
             "specificity": specificity,
+            "youden_j": (sensitivity + specificity - 1.0) if not math.isnan(sensitivity) and not math.isnan(specificity) else math.nan,
             "auroc": safe_metric(roc_auc_score, y_true, y_score) if has_both_classes else math.nan,
             "auprc": safe_metric(average_precision_score, y_true, y_score) if y_true.sum() > 0 else math.nan,
             "positive_count": int(y_true.sum()),
@@ -171,6 +208,7 @@ def evaluate_multilabel_predictions(
     summary = {
         "macro_accuracy": float(metrics_frame["accuracy"].mean()),
         "macro_balanced_accuracy": float(metrics_frame["balanced_accuracy"].mean(skipna=True)),
+        "macro_youden_j": float(metrics_frame["youden_j"].mean(skipna=True)),
         "macro_f1": float(metrics_frame["f1"].mean(skipna=True)),
         "macro_precision": float(metrics_frame["precision"].mean(skipna=True)),
         "macro_recall": float(metrics_frame["recall"].mean(skipna=True)),

@@ -39,8 +39,8 @@ class PatientGraphModel(nn.Module):
     ) -> None:
         super().__init__()
         
-        if prediction_level not in ["patient", "image"]:
-            raise ValueError("prediction_level must be either 'patient' or 'image'")
+        if prediction_level not in ["patient", "image", "dual_hub", "central_hub"]:
+            raise ValueError("prediction_level must be either 'patient', 'image', 'dual_hub', or 'central_hub'")
             
         self.prediction_level = prediction_level
         self.use_context = use_context
@@ -70,6 +70,17 @@ class PatientGraphModel(nn.Module):
         
         # 2. UPDATE patch_encoder to accept cnn_out_dim instead of patch_dim
         self.patch_encoder = nn.Sequential(
+            nn.Linear(cnn_out_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+        
+        # --- NEW: CLS Encoder ---
+        self.cls_encoder = nn.Sequential(
             nn.Linear(cnn_out_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
@@ -111,8 +122,12 @@ class PatientGraphModel(nn.Module):
                 "demographic": nn.Parameter(torch.zeros(hidden_dim)),
                 "patient": nn.Parameter(torch.zeros(hidden_dim)),
                 "label": nn.Parameter(torch.zeros(hidden_dim)),
+                "central": nn.Parameter(torch.zeros(hidden_dim)),
             }
         )
+        
+        if prediction_level == "central_hub":
+            self.central_token = nn.Parameter(torch.zeros(1, hidden_dim))
 
         # --- Heterogeneous Convolutions ---
         self.convs = nn.ModuleList()
@@ -121,31 +136,43 @@ class PatientGraphModel(nn.Module):
             
             # Base structural pathways
             conv_dict = {
-                ("label", "correlates", "label"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=True),
+                ("label", "correlates", "label"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=True, edge_dim=1),
             }
             if self.use_image_features:
                 conv_dict.update({
-                    ("patch", "adjacent", "patch"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=True),
-                    ("patch", "to", "image"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False),
-                    ("image", "to", "patch"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False),
+                    ("patch", "adjacent", "patch"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=True, edge_dim=1),
+                    ("patch", "to", "image"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1),
+                    ("image", "to", "patch"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1),
                 })
             
             # Context Pathways (removed for image-only baselines)
             if self.use_context:
                 conv_dict.update({
-                    ("image", "to", "patient"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False),
-                    ("patient", "to", "image"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False),
-                    ("demographic", "to", "patient"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False),
-                    ("patient", "to", "demographic"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False),
+                    ("image", "to", "patient"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1),
+                    ("patient", "to", "image"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1),
+                    ("demographic", "to", "patient"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1),
+                    ("patient", "to", "demographic"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1),
+                    ("demographic", "correlates", "demographic"): GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=True, edge_dim=1),
                 })
             
             # --- DYNAMIC LABEL PATHWAYS ---
-            if self.prediction_level == "patient":
-                conv_dict[("patient", "to", "label")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False)
-                conv_dict[("label", "to", "patient")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False)
-            elif self.prediction_level == "image":
-                conv_dict[("image", "to", "label")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False)
-                conv_dict[("label", "to", "image")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False)
+            if self.prediction_level in ["patient", "dual_hub"]:
+                conv_dict[("patient", "to", "label")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                conv_dict[("label", "to", "patient")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+            
+            if self.prediction_level in ["image", "dual_hub"]:
+                conv_dict[("image", "to", "label")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                conv_dict[("label", "to", "image")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                
+            if self.prediction_level == "central_hub":
+                conv_dict[("image", "to", "central")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                conv_dict[("central", "to", "image")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                
+                conv_dict[("patient", "to", "central")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                conv_dict[("central", "to", "patient")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                
+                conv_dict[("label", "to", "central")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
+                conv_dict[("central", "to", "label")] = GATConv((-1, -1), hidden_dim, heads=heads, concat=False, dropout=dropout, add_self_loops=False, edge_dim=1)
 
             conv = HeteroConv(conv_dict, aggr="mean")
             self.convs.append(conv)
@@ -158,6 +185,7 @@ class PatientGraphModel(nn.Module):
                         "demographic": nn.LayerNorm(hidden_dim),
                         "patient": nn.LayerNorm(hidden_dim),
                         "label": nn.LayerNorm(hidden_dim),
+                        "central": nn.LayerNorm(hidden_dim),
                     }
                 )
             )
@@ -170,6 +198,13 @@ class PatientGraphModel(nn.Module):
         )
 
         self.image_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_labels, bias=False),
+        )
+        
+        self.central_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -222,6 +257,9 @@ class PatientGraphModel(nn.Module):
             "label": self.label_token(data["label"].label_idx.long()) + self.type_bias["label"],
         }
         
+        if self.prediction_level == "central_hub":
+            x_dict["central"] = self.central_token.expand(data["central"].num_nodes, -1) + self.type_bias["central"]
+        
         # --- RETFOUND FEATURE EXTRACTION ---
         if self.use_image_features:
             # 2. Get the batched raw images from PyG: [Total_Images_in_Batch, 3, 256, 256]
@@ -236,6 +274,11 @@ class PatientGraphModel(nn.Module):
             if features.dim() == 3:
                 expected_patches = (imgs.shape[2] // 16) * (imgs.shape[3] // 16)
                 if features.shape[1] > expected_patches:
+                    # Extract the global CLS token and inject it into the Image Node!
+                    cls_token = features[:, 0, :]
+                    x_dict["image"] = x_dict["image"] + self.cls_encoder(cls_token)
+                    
+                    # Drop the CLS token for the patches
                     patch_features_seq = features[:, 1:, :] 
                 else:
                     patch_features_seq = features
@@ -249,7 +292,8 @@ class PatientGraphModel(nn.Module):
             x_dict["patch"] = self.patch_encoder(patch_features) + self.type_bias["patch"]
 
         for conv, norm in zip(self.convs, self.norms):
-            out_dict = conv(x_dict, data.edge_index_dict)
+            # Pass edge_attr_dict so GATConv receives the explicit edge features!
+            out_dict = conv(x_dict, data.edge_index_dict, data.edge_attr_dict)
             next_x = {}
             for node_type, x in x_dict.items():
                 if node_type in out_dict:
@@ -261,10 +305,10 @@ class PatientGraphModel(nn.Module):
             x_dict = next_x
 
         # --- DYNAMIC OUTPUT ROUTING ---
-        if self.prediction_level == "patient":
-            # Read from the label nodes (which aggregate the whole patient's state)
+        if self.prediction_level in ["patient", "dual_hub"]:
+            # Read from the label nodes (which aggregate both hubs simultaneously in dual_hub)
             logits = self.label_head(x_dict["label"]).squeeze(-1)
-            num_targets = data["patient"].num_nodes
+            num_targets = data["patient"].num_nodes if "patient" in data else data["image"].num_nodes
             logits = logits.view(num_targets, self.num_labels)
             return logits + self.output_bias
             
@@ -272,4 +316,10 @@ class PatientGraphModel(nn.Module):
             # Read directly from the enriched image nodes
             # Output inherently matches shape [num_images, num_labels]
             logits = self.image_head(x_dict["image"])
+            return logits + self.output_bias
+            
+        elif self.prediction_level == "central_hub":
+            logits = self.central_head(x_dict["central"])
+            num_targets = data["patient"].num_nodes if "patient" in data else data["image"].num_nodes
+            logits = logits.view(num_targets, self.num_labels)
             return logits + self.output_bias

@@ -248,7 +248,7 @@ def main() -> None:
             "image_size": args.image_size,
             "patch_size": args.patch_size,
             "connectivity": args.connectivity,
-            "prediction_level": "image"
+            "prediction_level": "central_hub"
         }
 
         # Initialize dataset once per configuration
@@ -301,7 +301,7 @@ def main() -> None:
             model = PatientGraphModel(
                 num_labels=len(label_columns), demographic_specs=demo_specs,
                 hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
-                prediction_level="image", initial_biases=adaptive_biases,
+                prediction_level="central_hub", initial_biases=adaptive_biases,
                 use_context=not exp["no_context"],
                 use_image_features=not exp.get("no_image", False)
             ).to(device)
@@ -451,7 +451,16 @@ def main() -> None:
                         
                         log_dict[f"val_auroc_per_class/{prefix}{label}"] = auroc
                         log_dict[f"val_auprc_per_class/{prefix}{label}"] = auprc
+                        
+                        # The optimal threshold used by the model (Youden for multilabel, F1 for single)
                         log_dict[f"val_optimal_threshold/{prefix}{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
+                        
+                        # Explicit Calibration Tracking
+                        log_dict[f"val_optimal_f1_threshold/{prefix}{label}"] = epoch_threshold_df.iloc[idx]["optimal_f1_threshold"]
+                        log_dict[f"val_calibrated_f1_at_f1_thresh/{prefix}{label}"] = epoch_threshold_df.iloc[idx]["validation_f1_at_f1_thresh"]
+                        if len(label_columns) > 1:
+                            log_dict[f"val_optimal_youden_threshold/{prefix}{label}"] = epoch_threshold_df.iloc[idx]["optimal_youden_threshold"]
+                            log_dict[f"val_calibrated_f1_at_youden_thresh/{prefix}{label}"] = epoch_threshold_df.iloc[idx]["validation_f1_at_youden_thresh"]
                         
                         log_dict[f"val_calibrated_f1_per_class/{prefix}{label}"] = calib_f1_normal
                         log_dict[f"val_calibrated_f1_macro_per_class/{prefix}{label}"] = calib_f1_macro
