@@ -36,9 +36,11 @@ class PatientGraphModel(nn.Module):
         initial_biases: Optional[Sequence[float]] = None,
         use_context: bool = True,
         use_image_features: bool = True,
+        backbone: str = "retfound",
     ) -> None:
         super().__init__()
         
+        self.backbone = backbone
         if prediction_level not in ["patient", "image", "dual_hub", "central_hub"]:
             raise ValueError("prediction_level must be either 'patient', 'image', 'dual_hub', or 'central_hub'")
             
@@ -51,22 +53,22 @@ class PatientGraphModel(nn.Module):
         self.dropout = dropout
         self.max_images_per_patient = max_images_per_patient
 
-        # --- NEW: Load Pre-trained Vision Backbone ---
+        # --- Load Pre-trained Vision Backbone ---
         try:
             import timm
         except ImportError as exc:
             raise SystemExit("Missing dependency: timm. Install it via 'pip install timm'") from exc
 
-        # Load RETFound ViT-Large using timm.
-        # dynamic_img_size=True allows the model to accept images of size 256x256 instead of default 224x224.
-        self.cnn = timm.create_model("hf_hub:bitfount/RETFound_MAE", pretrained=True, dynamic_img_size=True)
-        
-        # Freeze the CNN (Highly recommended so you don't run out of GPU memory)
-        for param in self.cnn.parameters():
-            param.requires_grad = False
-
-        # --- Node Encoders ---
-        cnn_out_dim = 1024 # ViT-Large feature dimension always has 1024 channels
+        if self.backbone == "retfound":
+            self.cnn = timm.create_model("hf_hub:bitfount/RETFound_MAE", pretrained=True, dynamic_img_size=True)
+            for param in self.cnn.parameters():
+                param.requires_grad = False
+            cnn_out_dim = 1024
+        elif self.backbone == "resnet":
+            self.cnn = timm.create_model("resnet50", pretrained=True, features_only=False)
+            cnn_out_dim = 2048
+        else:
+            raise ValueError("backbone must be 'retfound' or 'resnet'")
         
         # 2. UPDATE patch_encoder to accept cnn_out_dim instead of patch_dim
         self.patch_encoder = nn.Sequential(
@@ -79,7 +81,6 @@ class PatientGraphModel(nn.Module):
             nn.ReLU(),
         )
         
-        # --- NEW: CLS Encoder ---
         self.cls_encoder = nn.Sequential(
             nn.Linear(cnn_out_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -265,27 +266,30 @@ class PatientGraphModel(nn.Module):
             # 2. Get the batched raw images from PyG: [Total_Images_in_Batch, 3, 256, 256]
             imgs = data["image"].raw_images 
             
-            # 3. Extract Deep Spatial Features using the frozen RETFound model
-            with torch.no_grad(): # Keep gradient graph small to save massive amounts of VRAM
-                # ViT forward_features outputs shape [B, num_patches + 1, C] where +1 is the class token
-                features = self.cnn.forward_features(imgs)
-                
-            # 4. Reshape the sequence into our patch nodes
-            if features.dim() == 3:
-                expected_patches = (imgs.shape[2] // 16) * (imgs.shape[3] // 16)
-                if features.shape[1] > expected_patches:
-                    # Extract the global CLS token and inject it into the Image Node!
-                    # cls_token = features[:, 0, :]
-                    # x_dict["image"] = x_dict["image"] + self.cls_encoder(cls_token)
+            # 3. Extract Deep Spatial Features
+            if self.backbone == "retfound":
+                with torch.no_grad():
+                    features = self.cnn.forward_features(imgs)
                     
-                    # Drop the CLS token for the patches
-                    patch_features_seq = features[:, 1:, :] 
+                if features.dim() == 3:
+                    expected_patches = (imgs.shape[2] // 16) * (imgs.shape[3] // 16)
+                    if features.shape[1] > expected_patches:
+                        # Extract the global CLS token and inject it into the Image Node!
+                        # cls_token = features[:, 0, :]
+                        # x_dict["image"] = x_dict["image"] + self.cls_encoder(cls_token)
+                        
+                        patch_features_seq = features[:, 1:, :] 
+                    else:
+                        patch_features_seq = features
+                        
+                    b, num_patches, c = patch_features_seq.shape
+                    patch_features = patch_features_seq.reshape(-1, c)
                 else:
-                    patch_features_seq = features
+                    b, c, h, w = features.shape
+                    patch_features = features.permute(0, 2, 3, 1).reshape(-1, c)
                     
-                b, num_patches, c = patch_features_seq.shape
-                patch_features = patch_features_seq.reshape(-1, c)
-            else:
+            elif self.backbone == "resnet":
+                features = self.cnn.forward_features(imgs)
                 b, c, h, w = features.shape
                 patch_features = features.permute(0, 2, 3, 1).reshape(-1, c)
                 

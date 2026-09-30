@@ -134,8 +134,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--validation-manifest", type=str, default="image_validation_12.csv")
     
     p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--backbone", type=str, choices=["retfound", "resnet"], default="resnet")
     p.add_argument("--image-size", type=int, default=512)
-    p.add_argument("--patch-size", type=int, default=16)
+    p.add_argument("--patch-size", type=int, default=None, help="Defaults to 16 for retfound, 32 for resnet")
     p.add_argument("--connectivity", type=int, default=8, choices=[4, 8])
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--seed", type=int, default=12)
@@ -178,6 +179,9 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Environment Setup
+    if args.patch_size is None:
+        args.patch_size = 16 if args.backbone == "retfound" else 32
+        
     set_seed(args.seed, args.deterministic)
     device = select_device(args.device)
     print_runtime(device)
@@ -308,7 +312,8 @@ def main() -> None:
                 hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
                 prediction_level="central_hub", initial_biases=adaptive_biases,
                 use_context=not exp["no_context"],
-                use_image_features=not exp.get("no_image", False)
+                use_image_features=not exp.get("no_image", False),
+                backbone=args.backbone
             ).to(device)
 
             criterion = nn.BCEWithLogitsLoss(weight=class_weights, pos_weight=pos_weight)
