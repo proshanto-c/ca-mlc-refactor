@@ -70,26 +70,30 @@ class PatientGraphModel(nn.Module):
         else:
             raise ValueError("backbone must be 'retfound' or 'resnet'")
         
-        # 2. UPDATE patch_encoder to accept cnn_out_dim instead of patch_dim
-        self.patch_encoder = nn.Sequential(
-            nn.Linear(cnn_out_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-        )
-        
-        self.cls_encoder = nn.Sequential(
-            nn.Linear(cnn_out_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-        )
+        # 2. Dynamic Stepped Compression Encoders
+        def build_stepped_encoder(in_dim: int, out_dim: int, drop_rate: float) -> nn.Sequential:
+            layers = []
+            curr_dim = in_dim
+            while curr_dim > out_dim * 2:
+                next_dim = curr_dim // 2
+                layers.extend([
+                    nn.Linear(curr_dim, next_dim),
+                    nn.LayerNorm(next_dim),
+                    nn.ReLU(),
+                    nn.Dropout(drop_rate),
+                ])
+                curr_dim = next_dim
+            
+            # Final step to the target hidden dimension
+            layers.extend([
+                nn.Linear(curr_dim, out_dim),
+                nn.LayerNorm(out_dim),
+                nn.ReLU(),
+            ])
+            return nn.Sequential(*layers)
+            
+        self.patch_encoder = build_stepped_encoder(cnn_out_dim, hidden_dim, dropout)
+        self.cls_encoder = build_stepped_encoder(cnn_out_dim, hidden_dim, dropout)
 
         # --- Demographic Encoders ---
         self.demo_field_embed = nn.Embedding(len(self.demographic_specs), hidden_dim)
