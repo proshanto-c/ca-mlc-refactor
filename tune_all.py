@@ -287,7 +287,7 @@ def main() -> None:
 
         # Tuning Loop
         for trial in range(1, args.num_trials + 1):
-            h_dim = 32
+            h_dim = 256
             n_layers = 3
             dropout = 0.25
             batch_size = 32
