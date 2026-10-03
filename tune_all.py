@@ -51,7 +51,9 @@ from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 
 ALL_LABELS = [
     "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
-    "scar", "hypertensive_retinopathy", "amd", "myopic_fundus"
+    # "scar", 
+    # "hypertensive_retinopathy", 
+    # "amd", "myopic_fundus"
 ]
 
 DEFAULT_DEMOGRAPHIC_CANDIDATES = [
@@ -214,18 +216,17 @@ def main() -> None:
     ])
     
     # 3. Define the Model Configurations
-    models_list = []
+    models_list = [
+        {"name": "multilabel_img_ctx", "group": "Multilabel", "labels": ALL_LABELS, "no_context": False, "no_image": False},
+        {"name": "multilabel_img_only", "group": "Multilabel", "labels": ALL_LABELS, "no_context": True, "no_image": False},
+        {"name": "multilabel_ctx_only", "group": "Multilabel", "labels": ALL_LABELS, "no_context": False, "no_image": True},
+    ]
+    
     for label in ALL_LABELS:
         group_name = label.replace('_', ' ').title()
         models_list.append({"name": f"singlelabel_{label}_img_ctx", "group": group_name, "labels": [label], "no_context": False, "no_image": False})
         models_list.append({"name": f"singlelabel_{label}_img_only", "group": group_name, "labels": [label], "no_context": True, "no_image": False})
         models_list.append({"name": f"singlelabel_{label}_ctx_only", "group": group_name, "labels": [label], "no_context": False, "no_image": True})
-        
-    models_list.extend([
-        {"name": "multilabel_img_ctx", "group": "Multilabel", "labels": ALL_LABELS, "no_context": False, "no_image": False},
-        {"name": "multilabel_img_only", "group": "Multilabel", "labels": ALL_LABELS, "no_context": True, "no_image": False},
-        {"name": "multilabel_ctx_only", "group": "Multilabel", "labels": ALL_LABELS, "no_context": False, "no_image": True},
-    ])
 
     # 4. Filter for Splitting Across Devices
     total_models = len(models_list)
