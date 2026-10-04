@@ -51,9 +51,9 @@ from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 
 ALL_LABELS = [
     "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
-    # "scar", 
+    "scar", 
     # "hypertensive_retinopathy", 
-    # "amd", "myopic_fundus"
+    "amd", "myopic_fundus"
 ]
 
 DEFAULT_DEMOGRAPHIC_CANDIDATES = [
@@ -342,12 +342,14 @@ def main() -> None:
                 entity=args.wandb_entity, group=exp['group'], tags=args.wandb_tags, mode=args.wandb_mode
             )
 
+            # Dynamic checkpoint key
+            checkpoint_key = "auprc" if len(label_columns) == 1 else "macro_auprc"
+            checkpoint_key_f1 = "f1" if len(label_columns) == 1 else "micro_f1"
+            
             history = []
             best_metrics = {
-                "macro_f1": -1.0,
-                "micro_f1": -1.0,
-                "balanced_accuracy": -1.0,
-                "macro_auprc": -1.0
+                checkpoint_key: -1.0,
+                checkpoint_key_f1: -1.0
             }
             
             for epoch in range(1, args.epochs + 1):
@@ -391,15 +393,19 @@ def main() -> None:
                 
                 # Checkpoints
                 current_metrics = {
-                    "macro_f1": epoch_calibrated_f1,
-                    "micro_f1": epoch_calibrated_micro_f1,
-                    "balanced_accuracy": epoch_balanced_acc,
-                    "macro_auprc": val_res["summary"]["macro_auprc"]
+                    checkpoint_key: val_res["summary"]["macro_auprc"],
+                    checkpoint_key_f1: epoch_calibrated_micro_f1
                 }
                 
-                checkpoint_data = {
+                if args.backbone == "retfound":
                     # Strip the 1.2GB frozen RETFound ViT backbone from the saved weights!
-                    "model_state_dict": {k: v for k, v in model.state_dict().items() if not k.startswith("cnn.")},
+                    state_dict_to_save = {k: v for k, v in model.state_dict().items() if not k.startswith("cnn.")}
+                else:
+                    # ResNet is unfrozen and fine-tuned, so we MUST save its trained weights!
+                    state_dict_to_save = model.state_dict()
+                    
+                checkpoint_data = {
+                    "model_state_dict": state_dict_to_save,
                     "hyperparams": trial_config,
                     "epoch": epoch
                 }
@@ -412,10 +418,7 @@ def main() -> None:
                         
                         if wandb_run is not None:
                             wandb_run.summary[f"best_{metric_name}_checkpoint/epoch"] = epoch
-                            wandb_run.summary[f"best_{metric_name}_checkpoint/macro_f1"] = current_metrics["macro_f1"]
-                            wandb_run.summary[f"best_{metric_name}_checkpoint/micro_f1"] = current_metrics["micro_f1"]
-                            wandb_run.summary[f"best_{metric_name}_checkpoint/balanced_accuracy"] = current_metrics["balanced_accuracy"]
-                            wandb_run.summary[f"best_{metric_name}_checkpoint/macro_auprc"] = current_metrics["macro_auprc"]
+                            wandb_run.summary[f"best_{metric_name}_checkpoint/val"] = val
 
                 if wandb_run is not None:
                     y_true = val_res["targets"]

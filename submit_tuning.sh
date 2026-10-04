@@ -22,8 +22,8 @@ mkdir -p logs
 # 3. Setup Seed and Isolation
 # Pass the seed as the first argument to the script (defaults to 42 if not provided)
 SEED=${1:-42}
-PROJECT="4-L-ResNet+GNN"
-OUTPUT_DIR="/users/sann7128/ca-mlc-refactor/data/BRSET/runs/tuning_seed${SEED}"
+PROJECT="7-L-ResNet+GNN"
+OUTPUT_DIR="/users/sann7128/ca-mlc-refactor/data/BRSET/runs/7L-${SEED}"
 
 # 4. Run the tuning script
 # Each job gets its own unique SLURM_ARRAY_TASK_ID (0 to 14)
@@ -32,6 +32,6 @@ python tune_all.py \
     --output-dir "$OUTPUT_DIR" \
     --seed $SEED \
     --wandb-project "$PROJECT" \
-    --split-total 15 \
+    --split-total 24 \
     --split-index $SLURM_ARRAY_TASK_ID \
     --num-trials 1
