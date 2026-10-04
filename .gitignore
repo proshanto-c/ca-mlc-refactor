@@ -10,6 +10,7 @@
 !utils/
 !utils/** 
 !generate_splits.py
+!resize_dataset.py
 
 !gnn/
 !gnn/**

@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--monitor", choices=["val_loss", "val_macro_f1"], default="val_loss")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=10)
     p.add_argument("--num-trials", type=int, default=1, help="Number of random search trials per model config.")
 
     # Splitting Arguments
@@ -246,7 +246,7 @@ def main() -> None:
         label_columns = exp["labels"]
         
         dataset_kwargs = {
-            "image_dir": root / "fundus_photos",
+            "image_dir": root / "fundus_photos_512",
             "target_cols": label_columns,
             "demo_cols": demo_columns,
             "demo_specs": demo_specs,
@@ -316,6 +316,16 @@ def main() -> None:
                 use_image_features=not exp.get("no_image", False),
                 backbone=args.backbone
             ).to(device)
+            
+            # Massive speedup for modern GPUs (20-30% faster matrix operations)
+            # Only enable on Linux/SLURM (Triton compiler doesn't support native Windows)
+            if os.name != 'nt':
+                try:
+                    model = torch.compile(model)
+                except Exception as e:
+                    print(f"Skipping torch.compile: {e}")
+            else:
+                print("Skipping torch.compile on Windows (Triton unsupported).")
 
             criterion = nn.BCEWithLogitsLoss(weight=class_weights, pos_weight=pos_weight)
             optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)

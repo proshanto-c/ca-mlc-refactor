@@ -73,7 +73,7 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
     no_image = hyperparams.get("no_image", False)
     
     dataset_kwargs = {
-        "image_dir": args.root.expanduser().resolve() / "fundus_photos",
+        "image_dir": args.root.expanduser().resolve() / "fundus_photos_512",
         "target_cols": label_columns,
         "demo_cols": demo_columns,
         "demo_specs": demo_specs,
