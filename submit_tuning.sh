@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4           # Request 4 CPU cores for dataloading
+#SBATCH --cpus-per-task=8           # Request 8 CPU cores for dataloading
 #SBATCH --mem=32G                   # Request 32GB total memory
 #SBATCH --gres=gpu:1                # Request 1 GPU
 #SBATCH --time=47:59:00             # Max time limit
