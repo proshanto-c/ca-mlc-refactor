@@ -327,7 +327,8 @@ def main() -> None:
             else:
                 print("Skipping torch.compile on Windows (Triton unsupported).")
 
-            criterion = nn.BCEWithLogitsLoss(weight=class_weights, pos_weight=pos_weight)
+            # Removed weight=class_weights to prevent massive double-weighted gradient spikes from rare labels!
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
             scaler = make_grad_scaler(amp_enabled)
             # Linear warm-up from 1% of base LR up to 100% over the first 10% of epochs
