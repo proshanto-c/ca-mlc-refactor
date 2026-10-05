@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from sklearn.metrics import f1_score, roc_auc_score, average_precision_score, accuracy_score, balanced_accuracy_score
+from sklearn.metrics import f1_score, roc_auc_score, average_precision_score, accuracy_score, balanced_accuracy_score, precision_score, recall_score
 
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
 from gnn.patientgraphmodel import PatientGraphModel, DemographicSpec
@@ -152,6 +152,8 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
             auprc = 0.0
             
         f1 = f1_score(true_lbl, pred_lbl, zero_division=0)
+        precision = precision_score(true_lbl, pred_lbl, zero_division=0)
+        recall = recall_score(true_lbl, pred_lbl, zero_division=0)
         acc = accuracy_score(true_lbl, pred_lbl)
         bal_acc = balanced_accuracy_score(true_lbl, pred_lbl)
         
@@ -159,6 +161,8 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
             "AUPRC": auprc,
             "AUROC": auroc,
             "F1": f1,
+            "Precision": precision,
+            "Recall": recall,
             "Acc": acc,
             "Bal_Acc": bal_acc
         }
@@ -221,7 +225,7 @@ def main():
                     # Print local results
                     print(f" --- {exp_name.upper()} : {ckpt_key.upper()} CHECKPOINT ---")
                     for label, vals in metrics.items():
-                        print(f"  -> {label}: AUPRC={vals['AUPRC']:.4f} | F1={vals['F1']:.4f} | BalAcc={vals['Bal_Acc']:.4f}")
+                        print(f"  -> {label}: AUPRC={vals['AUPRC']:.4f} | F1={vals['F1']:.4f} | Prec={vals['Precision']:.4f} | Rec={vals['Recall']:.4f} | BalAcc={vals['Bal_Acc']:.4f}")
             except Exception as e:
                 print(f"[{config_dir.name}] Failed to evaluate {ckpt_path.name}: {e}")
             

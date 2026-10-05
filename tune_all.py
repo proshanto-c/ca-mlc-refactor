@@ -352,10 +352,10 @@ def main() -> None:
                 }
                 
                 if args.backbone == "retfound":
-                    # Strip the 1.2GB frozen RETFound ViT backbone from the saved weights!
+                    # RETFound backbone is frozen and not tuned, so omit static weights (cnn.) to save ~1.2GB per checkpoint
                     state_dict_to_save = {k: v for k, v in model.state_dict().items() if not k.startswith("cnn.")}
                 else:
-                    # ResNet is unfrozen and fine-tuned, so we MUST save its trained weights!
+                    # Tuned backbones (e.g. resnet) and all tuned model layers are saved in full
                     state_dict_to_save = model.state_dict()
                     
                 checkpoint_data = {
