@@ -8,13 +8,14 @@ import numpy as np
 import pandas as pd
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from sklearn.metrics import f1_score, roc_auc_score, average_precision_score, accuracy_score, balanced_accuracy_score
+from sklearn.metrics import f1_score, roc_auc_score, average_precision_score, accuracy_score, balanced_accuracy_score, precision_score, recall_score
 
 from data_functions.BRSETGraphDataset import BRSETGraphDataset
 from gnn.patientgraphmodel import PatientGraphModel, DemographicSpec
 from utils.data_functions import create_dataloader
 from utils.train_functions import graph_epoch
 from utils.util_functions import select_device, set_seed
+from utils.feature_engineering import preprocess_comorbidities, infer_demographic_columns, fit_demographic_specs
 
 # Hardcoded base labels and demographics for the schema
 ALL_LABELS = [
@@ -47,7 +48,7 @@ def load_demographic_specs(hyperparams):
     return specs
 
 
-def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpoint_path):
+def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpoint_path, fallback_demo_specs):
     if not checkpoint_path.exists():
         print(f"[{config_dir.name}] Skipping... No checkpoint found at {checkpoint_path}.")
         return None
@@ -61,6 +62,18 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
     label_columns = hyperparams.get("labels", ALL_LABELS)
     demo_columns = hyperparams.get("demo_cols", [])
     demo_specs = load_demographic_specs(hyperparams)
+    if not demo_specs:
+        print("  -> Warning: demo_specs missing from checkpoint. Using dynamically recalculated fallback!")
+        demo_specs = fallback_demo_specs
+        
+    if not demo_columns:
+        demo_columns = [ds.name for ds in demo_specs]
+    
+    # Ensure all demo_columns exist in test_frame
+    test_frame = test_frame.copy()
+    for col in demo_columns:
+        if col not in test_frame.columns:
+            test_frame[col] = 0.0
     
     # Defaults in case the checkpoint doesn't have them
     h_dim = hyperparams.get("h_dim", 256)
@@ -139,6 +152,8 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
             auprc = 0.0
             
         f1 = f1_score(true_lbl, pred_lbl, zero_division=0)
+        precision = precision_score(true_lbl, pred_lbl, zero_division=0)
+        recall = recall_score(true_lbl, pred_lbl, zero_division=0)
         acc = accuracy_score(true_lbl, pred_lbl)
         bal_acc = balanced_accuracy_score(true_lbl, pred_lbl)
         
@@ -146,6 +161,8 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
             "AUPRC": auprc,
             "AUROC": auroc,
             "F1": f1,
+            "Precision": precision,
+            "Recall": recall,
             "Acc": acc,
             "Bal_Acc": bal_acc
         }
@@ -160,7 +177,21 @@ def main():
     root = args.root.expanduser().resolve()
     prepared_dir = args.prepared_dir.expanduser().resolve() if args.prepared_dir else (root / "prepared")
     
-    test_frame = pd.read_csv(prepared_dir / args.test_manifest)
+    test_manifest_path = Path(args.test_manifest) if Path(args.test_manifest).is_absolute() else prepared_dir / args.test_manifest
+    test_frame = pd.read_csv(test_manifest_path)
+    
+    # Calculate fallback demo_specs for old checkpoints & preprocess comorbidities on test_frame
+    train_manifest_path = prepared_dir / "image_train_12.csv"
+    if train_manifest_path.exists():
+        train_frame = pd.read_csv(train_manifest_path)
+        train_frame, top_comorb = preprocess_comorbidities(train_frame, top_k=20)
+        test_frame, _ = preprocess_comorbidities(test_frame, valid_comorb=top_comorb)
+        fallback_demo_cols = infer_demographic_columns(train_frame, None, ALL_LABELS)
+        fallback_demo_specs = fit_demographic_specs(train_frame, fallback_demo_cols)
+    else:
+        test_frame, top_comorb = preprocess_comorbidities(test_frame, top_k=20)
+        fallback_demo_cols = infer_demographic_columns(test_frame, None, ALL_LABELS)
+        fallback_demo_specs = fit_demographic_specs(test_frame, fallback_demo_cols)
     
     test_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
@@ -173,15 +204,15 @@ def main():
     all_results = {}
     
     for config_dir in sorted(model_dirs):
-        # Find all 'best' checkpoints to evaluate
-        checkpoints = list(config_dir.glob("checkpoint_best_*.pt"))
+        # Find all 'best' checkpoints to evaluate recursively (since they are nested in trial_* folders)
+        checkpoints = list(config_dir.rglob("checkpoint_best_*.pt"))
         if not checkpoints:
             print(f"[{config_dir.name}] No optimal checkpoints found, skipping.")
             continue
             
         for ckpt_path in checkpoints:
             try:
-                res = evaluate_model(config_dir, args, device, test_transform, test_frame, ckpt_path)
+                res = evaluate_model(config_dir, args, device, test_transform, test_frame, ckpt_path, fallback_demo_specs)
                 if res is not None:
                     metrics, exp_name = res
                     
@@ -194,7 +225,7 @@ def main():
                     # Print local results
                     print(f" --- {exp_name.upper()} : {ckpt_key.upper()} CHECKPOINT ---")
                     for label, vals in metrics.items():
-                        print(f"  -> {label}: AUPRC={vals['AUPRC']:.4f} | F1={vals['F1']:.4f} | BalAcc={vals['Bal_Acc']:.4f}")
+                        print(f"  -> {label}: AUPRC={vals['AUPRC']:.4f} | F1={vals['F1']:.4f} | Prec={vals['Precision']:.4f} | Rec={vals['Recall']:.4f} | BalAcc={vals['Bal_Acc']:.4f}")
             except Exception as e:
                 print(f"[{config_dir.name}] Failed to evaluate {ckpt_path.name}: {e}")
             
