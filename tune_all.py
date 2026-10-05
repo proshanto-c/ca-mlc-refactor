@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--monitor", choices=["val_loss", "val_macro_f1"], default="val_loss")
-    p.add_argument("--num-workers", type=int, default=10)
+    p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--num-trials", type=int, default=1, help="Number of random search trials per model config.")
 
     # Splitting Arguments
