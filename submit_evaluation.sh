@@ -18,15 +18,15 @@ mkdir -p logs
 # 3. Setup Seed and Isolation
 # Pass the seed as the first argument to the script (defaults to 42 if not provided)
 SEED=${1:-42}
-RUNS_DIR="/users/sann7128/ca-mlc-refactor/data/BRSET/runs/7L-${SEED}"
+RUNS_DIR="/data/BRSET/runs/7L-${SEED}"
 
 echo "Starting evaluation for runs in: $RUNS_DIR"
 
 # 4. Run the evaluation script
 python evaluate_all.py \
-    --root "/users/sann7128/ca-mlc-refactor/data/BRSET" \
+    --root "/data/BRSET" \
     --runs-dir "$RUNS_DIR" \
-    --test-manifest "image_test_12.csv" \
+    --test-manifest "image_evaluation_12.csv" \
     --image-size 512 \
     --device "cuda"
 
