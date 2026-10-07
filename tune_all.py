@@ -57,9 +57,7 @@ from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 
 ALL_LABELS = [
     "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
-    "scar", 
-    # "hypertensive_retinopathy", 
-    "amd", "myopic_fundus"
+    "scar", "hypertensive_retinopathy", "amd", "myopic_fundus"
 ]
 
 
@@ -80,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backbone", type=str, choices=["retfound", "resnet"], default="resnet")
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=None, help="Defaults to 16 for retfound, 32 for resnet")
-    p.add_argument("--connectivity", type=int, default=8, choices=[4, 8])
+    p.add_argument("--connectivity", default="fc", help="Patch graph connectivity (fc, 4, or 8)")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--seed", type=int, default=12)
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -144,16 +142,20 @@ def main() -> None:
     demo_specs = fit_demographic_specs(train_frame, demo_columns)
 
     # Transforms
+    norm_step = [transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])] if args.backbone == "resnet" else []
+
     train_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
         transforms.RandomRotation(degrees=15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        *norm_step
     ])
 
     val_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        *norm_step
     ])
     
     # 3. Define the Model Configurations
@@ -194,7 +196,8 @@ def main() -> None:
             "image_size": args.image_size,
             "patch_size": args.patch_size,
             "connectivity": args.connectivity,
-            "prediction_level": "central_hub"
+            "prediction_level": "central_hub",
+            "train_frame": train_frame
         }
 
         # Initialize dataset once per configuration
@@ -287,6 +290,8 @@ def main() -> None:
                 "batch_size": batch_size, "lr": learning_rate, "seed": args.seed,
                 "demo_cols": demo_columns,
                 "demo_specs": [ds.__dict__ for ds in demo_specs],
+                "train_manifest": args.train_manifest,
+                "backbone": args.backbone
             }
             write_json(run_dir / "run_config.json", trial_config)
 
@@ -351,12 +356,13 @@ def main() -> None:
                     checkpoint_key_f1: epoch_calibrated_micro_f1
                 }
                 
+                raw_model = getattr(model, "_orig_mod", model)
                 if args.backbone == "retfound":
                     # RETFound backbone is frozen and not tuned, so omit static weights (cnn.) to save ~1.2GB per checkpoint
-                    state_dict_to_save = {k: v for k, v in model.state_dict().items() if not k.startswith("cnn.")}
+                    state_dict_to_save = {k: v for k, v in raw_model.state_dict().items() if not k.startswith("cnn.")}
                 else:
                     # Tuned backbones (e.g. resnet) and all tuned model layers are saved in full
-                    state_dict_to_save = model.state_dict()
+                    state_dict_to_save = raw_model.state_dict()
                     
                 checkpoint_data = {
                     "model_state_dict": state_dict_to_save,

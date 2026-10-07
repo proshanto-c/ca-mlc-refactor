@@ -22,8 +22,8 @@ mkdir -p logs
 # 3. Setup Seed and Isolation
 # Pass the seed as the first argument to the script (defaults to 42 if not provided)
 SEED=${1:-42}
-PROJECT="7-L-ResNet+GNN"
-OUTPUT_DIR="/users/sann7128/ca-mlc-refactor/data/BRSET/runs/7L-${SEED}"
+PROJECT="8-L-7.10"
+OUTPUT_DIR="/users/sann7128/ca-mlc-refactor/data/BRSET/runs/8L-${SEED}"
 
 # 4. Run the tuning script
 # Each job gets its own unique SLURM_ARRAY_TASK_ID (0 to 14)

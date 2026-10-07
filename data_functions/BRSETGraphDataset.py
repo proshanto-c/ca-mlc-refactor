@@ -43,28 +43,42 @@ def patchify(image: torch.Tensor, patch_size: int):
     return patches, coord_tensor, grid_h, grid_w
 
 
-def grid_edge_index(grid_h: int, grid_w: int, connectivity: int, device=None) -> torch.Tensor:
-    if connectivity not in (4, 8):
-        raise ValueError("connectivity must be 4 or 8")
+def grid_edge_index(grid_h: int, grid_w: int, connectivity: Any = "fc", device=None) -> torch.Tensor:
+    n_patches = grid_h * grid_w
+    conn_str = str(connectivity).lower()
+    
+    if conn_str in ("fc", "fully_connected", "all", "0"):
+        # Fully Connected (FC) patch graph: every patch connects to every other patch
+        src = torch.arange(n_patches, device=device).repeat_interleave(n_patches)
+        dst = torch.arange(n_patches, device=device).repeat(n_patches)
+        mask = src != dst
+        return torch.stack([src[mask], dst[mask]], dim=0)
+    elif connectivity in (4, 8, "4", "8"):
+        c_val = int(connectivity)
+        neighbors_4 = [(0, 1), (1, 0), (-1, 0), (0, -1)]
+        neighbors_8 = neighbors_4 + [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+        neighbors = neighbors_8 if c_val == 8 else neighbors_4
 
-    neighbors_4 = [(0, 1), (1, 0), (-1, 0), (0, -1)]
-    neighbors_8 = neighbors_4 + [(1, 1), (1, -1), (-1, 1), (-1, -1)]
-    neighbors = neighbors_8 if connectivity == 8 else neighbors_4
+        def idx(r: int, c: int) -> int:
+            return r * grid_w + c
 
-    def idx(r: int, c: int) -> int:
-        return r * grid_w + c
+        src, dst = [], []
+        for r in range(grid_h):
+            for c in range(grid_w):
+                i = idx(r, c)
+                for dr, dc in neighbors:
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < grid_h and 0 <= cc < grid_w:
+                        src.append(i)
+                        dst.append(idx(rr, cc))
 
-    src, dst = [], []
-    for r in range(grid_h):
-        for c in range(grid_w):
-            i = idx(r, c)
-            for dr, dc in neighbors:
-                rr, cc = r + dr, c + dc
-                if 0 <= rr < grid_h and 0 <= cc < grid_w:
-                    src.append(i)
-                    dst.append(idx(rr, cc))
-
-    return torch.tensor([src, dst], dtype=torch.long, device=device)
+        return torch.tensor([src, dst], dtype=torch.long, device=device)
+    else:
+        # Default fallback to FC
+        src = torch.arange(n_patches, device=device).repeat_interleave(n_patches)
+        dst = torch.arange(n_patches, device=device).repeat(n_patches)
+        mask = src != dst
+        return torch.stack([src[mask], dst[mask]], dim=0)
 
 class BRSETGraphDataset(Dataset):
     """
@@ -79,10 +93,13 @@ class BRSETGraphDataset(Dataset):
         demo_specs: List[Any], 
         image_size: int = 256,
         patch_size: int = 32,
-        connectivity: int = 4,
+        connectivity: Any = "fc",
         transform: Optional[Callable] = None,
         validate_paths: bool = True,
-        prediction_level: str = "patient"
+        prediction_level: str = "patient",
+        train_frame: Optional[pd.DataFrame] = None,
+        label_corr_matrix: Optional[torch.Tensor] = None,
+        demo_corr_matrix: Optional[torch.Tensor] = None,
     ) -> None:
         
         if prediction_level not in ["patient", "image", "dual_hub", "central_hub"]:
@@ -99,6 +116,9 @@ class BRSETGraphDataset(Dataset):
         self.target_cols = target_cols
         self.demo_cols = demo_cols
         self.demo_specs = demo_specs
+        self.train_frame = train_frame
+        self.preset_label_corr = label_corr_matrix
+        self.preset_demo_corr = demo_corr_matrix
         
         self.image_size = image_size
         self.patch_size = patch_size
@@ -136,31 +156,48 @@ class BRSETGraphDataset(Dataset):
         self.base_patch_to_img_dst = torch.zeros(self.n_patches, dtype=torch.long)
 
     def _cache_correlations(self) -> None:
-        """Calculates Pearson correlation matrices for labels and demographics on the training split."""
-        # Label correlation
-        if len(self.target_cols) > 1:
-            lbl_df = self.frame[self.target_cols].astype(float)
-            corr = lbl_df.corr(method="pearson").fillna(0.0).values
+        """Calculates Pearson correlation matrices for labels and demographics strictly from the training split."""
+        if self.preset_label_corr is not None and self.preset_demo_corr is not None:
+            self.label_corr_matrix = self.preset_label_corr
+            self.demo_corr_matrix = self.preset_demo_corr
+            return
+
+        ref_df = self.train_frame
+        if ref_df is None:
+            raise ValueError(
+                "BRSETGraphDataset strictly requires `train_frame` to compute Pearson correlation matrices "
+                "from the training split. Passing non-training data without `train_frame` is strictly forbidden."
+            )
+
+        # 1. Label correlation
+        if self.preset_label_corr is not None:
+            self.label_corr_matrix = self.preset_label_corr
         else:
-            corr = np.array([[1.0]])
-        self.label_corr_matrix = torch.tensor(corr, dtype=torch.float32)
+            if len(self.target_cols) > 1:
+                lbl_df = ref_df[self.target_cols].astype(float)
+                corr = lbl_df.corr(method="pearson").fillna(0.0).values
+            else:
+                corr = np.array([[1.0]])
+            self.label_corr_matrix = torch.tensor(corr, dtype=torch.float32)
         
-        # Demographic correlation
-        demo_names = [s.name for s in self.demo_specs]
-        if len(demo_names) > 1:
-            # We convert categorical to numeric codes for correlation
-            demo_df = self.frame[demo_names].copy()
-            for s in self.demo_specs:
-                if s.kind == "categorical":
-                    demo_df[s.name] = demo_df[s.name].astype("category").cat.codes
-                else:
-                    if demo_df[s.name].dtype == object:
-                        demo_df[s.name] = demo_df[s.name].str.replace(',', '.', regex=False)
-                    demo_df[s.name] = pd.to_numeric(demo_df[s.name], errors="coerce")
-            demo_corr = demo_df.corr(method="pearson").fillna(0.0).values
+        # 2. Demographic correlation
+        if self.preset_demo_corr is not None:
+            self.demo_corr_matrix = self.preset_demo_corr
         else:
-            demo_corr = np.array([[1.0]])
-        self.demo_corr_matrix = torch.tensor(demo_corr, dtype=torch.float32)
+            demo_names = [s.name for s in self.demo_specs]
+            if len(demo_names) > 1:
+                demo_df = ref_df[demo_names].copy()
+                for s in self.demo_specs:
+                    if s.kind == "categorical":
+                        demo_df[s.name] = demo_df[s.name].astype("category").cat.codes
+                    else:
+                        if demo_df[s.name].dtype == object:
+                            demo_df[s.name] = demo_df[s.name].str.replace(',', '.', regex=False)
+                        demo_df[s.name] = pd.to_numeric(demo_df[s.name], errors="coerce")
+                demo_corr = demo_df.corr(method="pearson").fillna(0.0).values
+            else:
+                demo_corr = np.array([[1.0]])
+            self.demo_corr_matrix = torch.tensor(demo_corr, dtype=torch.float32)
 
     def _build_samples(self, validate: bool) -> None:
         """Constructs either multi-image patient hubs or single-image standalone graphs."""

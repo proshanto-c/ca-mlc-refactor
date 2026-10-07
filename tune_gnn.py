@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--demographic-columns", nargs="*", default=None)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--patch-size", type=int, default=16)
-    p.add_argument("--connectivity", type=int, default=4, choices=[4, 8])
+    p.add_argument("--connectivity", default="fc", help="Patch graph connectivity (fc, 4, or 8)")
     p.add_argument("--epochs", type=int, default=50)
     # p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
@@ -150,17 +150,19 @@ def main() -> None:
     demo_columns = infer_demographic_columns(train_frame, args.demographic_columns, label_columns)
     demo_specs = fit_demographic_specs(train_frame, demo_columns)
 
-    # Define your transforms (crucially including Resize!)
+    # Define your transforms (including ImageNet normalization for ResNet backbones)
     train_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
         transforms.RandomRotation(degrees=15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     val_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     # 3. Instantiate Modular Datasets (Memory-Loaded)
@@ -172,7 +174,8 @@ def main() -> None:
         "image_size": args.image_size,
         "patch_size": args.patch_size,
         "connectivity": args.connectivity,
-        "prediction_level": args.prediction_level
+        "prediction_level": args.prediction_level,
+        "train_frame": train_frame
     }
 
     train_dataset = BRSETGraphDataset(

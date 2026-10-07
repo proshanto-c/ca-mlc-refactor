@@ -20,7 +20,7 @@ from utils.feature_engineering import preprocess_comorbidities, infer_demographi
 # Hardcoded base labels and demographics for the schema
 ALL_LABELS = [
     "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
-    "scar", "amd", "myopic_fundus"
+    "scar", "hypertensive_retinopathy", "amd", "myopic_fundus"
 ]
 
 def parse_args():
@@ -48,7 +48,7 @@ def load_demographic_specs(hyperparams):
     return specs
 
 
-def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpoint_path, fallback_demo_specs):
+def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpoint_path, fallback_demo_specs, train_frame: pd.DataFrame):
     if not checkpoint_path.exists():
         print(f"[{config_dir.name}] Skipping... No checkpoint found at {checkpoint_path}.")
         return None
@@ -81,7 +81,7 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
     dropout = hyperparams.get("dropout", 0.0)
     backbone = hyperparams.get("backbone", "resnet")
     patch_size = hyperparams.get("patch_size", 32)
-    connectivity = hyperparams.get("connectivity", 8)
+    connectivity = hyperparams.get("connectivity", "fc")
     no_context = hyperparams.get("no_context", False)
     no_image = hyperparams.get("no_image", False)
     
@@ -93,13 +93,21 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
         "image_size": args.image_size,
         "patch_size": patch_size,
         "connectivity": connectivity,
-        "prediction_level": "central_hub"
+        "prediction_level": "central_hub",
+        "train_frame": train_frame
     }
+    
+    norm_step = [transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])] if backbone == "resnet" else []
+    eval_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        *norm_step
+    ])
     
     test_dataset = BRSETGraphDataset(
         data=test_frame,
         validate_paths=False,
-        transform=test_transform,
+        transform=eval_transform,
         **dataset_kwargs
     )
     
@@ -122,8 +130,10 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
         backbone=backbone
     ).to(device)
     
-    # Strict=False because we don't save the CNN weights in tune_all.py (it drops 'cnn.')
-    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    # Strip '_orig_mod.' prefix if checkpoint was saved from a compiled model
+    raw_state_dict = ckpt.get("model_state_dict", {})
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw_state_dict.items()}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     
     # Run Evaluation
     res = graph_epoch(
@@ -182,16 +192,13 @@ def main():
     
     # Calculate fallback demo_specs for old checkpoints & preprocess comorbidities on test_frame
     train_manifest_path = prepared_dir / "image_train_12.csv"
-    if train_manifest_path.exists():
-        train_frame = pd.read_csv(train_manifest_path)
-        train_frame, top_comorb = preprocess_comorbidities(train_frame, top_k=20)
-        test_frame, _ = preprocess_comorbidities(test_frame, valid_comorb=top_comorb)
-        fallback_demo_cols = infer_demographic_columns(train_frame, None, ALL_LABELS)
-        fallback_demo_specs = fit_demographic_specs(train_frame, fallback_demo_cols)
-    else:
-        test_frame, top_comorb = preprocess_comorbidities(test_frame, top_k=20)
-        fallback_demo_cols = infer_demographic_columns(test_frame, None, ALL_LABELS)
-        fallback_demo_specs = fit_demographic_specs(test_frame, fallback_demo_cols)
+    if not train_manifest_path.exists():
+        raise FileNotFoundError(f"Training manifest not found at {train_manifest_path}. Evaluation strictly requires train_frame to compute training statistics and Pearson correlations.")
+    train_frame = pd.read_csv(train_manifest_path)
+    train_frame, top_comorb = preprocess_comorbidities(train_frame, top_k=20)
+    test_frame, _ = preprocess_comorbidities(test_frame, valid_comorb=top_comorb)
+    fallback_demo_cols = infer_demographic_columns(train_frame, None, ALL_LABELS)
+    fallback_demo_specs = fit_demographic_specs(train_frame, fallback_demo_cols)
     
     test_transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size), interpolation=InterpolationMode.BILINEAR),
@@ -212,7 +219,7 @@ def main():
             
         for ckpt_path in checkpoints:
             try:
-                res = evaluate_model(config_dir, args, device, test_transform, test_frame, ckpt_path, fallback_demo_specs)
+                res = evaluate_model(config_dir, args, device, test_transform, test_frame, ckpt_path, fallback_demo_specs, train_frame=train_frame)
                 if res is not None:
                     metrics, exp_name = res
                     
