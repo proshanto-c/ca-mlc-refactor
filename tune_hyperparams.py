@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 import random
@@ -6,6 +7,8 @@ import sys
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Sequence
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import numpy as np
 import pandas as pd
@@ -199,7 +202,7 @@ def main() -> None:
         "image_size": args.image_size,
         "patch_size": args.patch_size,
         "connectivity": args.connectivity,
-        "prediction_level": "central_hub",
+        "prediction_level": "dual_hub",
         "train_frame": train_frame
     }
 
@@ -237,15 +240,28 @@ def main() -> None:
 
     # Trial Execution Loop
     for trial_idx, hparams in enumerate(my_trials, start=start_idx + 1):
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         h_dim = hparams["hidden_dim"]
         n_layers = hparams["num_layers"]
         heads = hparams["heads"]
         dropout = hparams["dropout"]
         
+        # Adaptive micro-batching for large models to prevent CUDA OOM
+        if h_dim >= 512:
+            micro_batch_size = max(1, args.batch_size // 2)
+            accum_steps = max(1, args.batch_size // micro_batch_size)
+        else:
+            micro_batch_size = args.batch_size
+            accum_steps = 1
+
         trial_name = f"trial_{trial_idx:02d}_h{h_dim}_l{n_layers}_head{heads}_drop{dropout}"
         print("===================================================================")
         print(f"=== [TRIAL {trial_idx}/{total_trials}] {trial_name.upper()} ===")
         print(f"=== Params: h_dim={h_dim}, n_layers={n_layers}, heads={heads}, dropout={dropout} ===")
+        print(f"=== Micro-batch: {micro_batch_size}, Grad Accumulation: {accum_steps} ===")
         print("===================================================================\n")
 
         run_dir = output_dir / trial_name
@@ -253,12 +269,12 @@ def main() -> None:
         checkpoint_path = run_dir / "final_checkpoint.pt"
 
         train_loader = create_dataloader(
-            dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
+            dataset=train_dataset, batch_size=micro_batch_size, shuffle=True,
             num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
             seed=args.seed + trial_idx, is_graph=True
         )
         val_loader = create_dataloader(
-            dataset=val_dataset, batch_size=args.batch_size, shuffle=False,
+            dataset=val_dataset, batch_size=micro_batch_size, shuffle=False,
             num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
             seed=args.seed, is_graph=True
         )
@@ -270,7 +286,7 @@ def main() -> None:
             num_layers=n_layers,
             dropout=dropout,
             heads=heads,
-            prediction_level="central_hub",
+            prediction_level="dual_hub",
             initial_biases=adaptive_biases,
             use_context=False,          # Image-Only model baseline
             use_image_features=True,    # Image features enabled
@@ -303,6 +319,8 @@ def main() -> None:
             "heads": heads,
             "dropout": dropout,
             "batch_size": args.batch_size,
+            "micro_batch_size": micro_batch_size,
+            "accum_steps": accum_steps,
             "lr": args.learning_rate,
             "seed": args.seed,
             "demo_cols": demo_columns,
@@ -339,7 +357,8 @@ def main() -> None:
             train_res = graph_epoch(
                 model=model, loader=train_loader, criterion=criterion, device=device,
                 amp_enabled=amp_enabled, label_columns=ALL_LABELS, optimizer=optimizer,
-                scaler=scaler, desc=f"[{trial_name}] E{epoch:02d} Train", threshold=args.threshold
+                scaler=scaler, desc=f"[{trial_name}] E{epoch:02d} Train", threshold=args.threshold,
+                accum_steps=accum_steps
             )
             scheduler.step()
 
@@ -538,10 +557,12 @@ def main() -> None:
                 c_stats = final_eval_summary["per_class"][label]
                 wandb_run.summary[f"best_val_per_class/auprc_{prefix}{label}"] = c_stats["auprc"]
                 wandb_run.summary[f"best_val_per_class/auroc_{prefix}{label}"] = c_stats["auroc"]
-                wandb_run.summary[f"best_val_per_class/f1_calibrated_{prefix}{label}"] = c_stats["calibrated_f1"]
-                wandb_run.summary[f"best_val_per_class/optimal_threshold_{prefix}{label}"] = c_stats["optimal_threshold"]
-
             wandb_run.finish()
+
+        del model, optimizer, train_loader, val_loader
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     print("\nHyperparameter tuning complete!")
 

@@ -196,7 +196,7 @@ def main() -> None:
             "image_size": args.image_size,
             "patch_size": args.patch_size,
             "connectivity": args.connectivity,
-            "prediction_level": "central_hub",
+            "prediction_level": "dual_hub",
             "train_frame": train_frame
         }
 
@@ -255,7 +255,7 @@ def main() -> None:
             model = PatientGraphModel(
                 num_labels=len(label_columns), demographic_specs=demo_specs,
                 hidden_dim=h_dim, num_layers=n_layers, dropout=dropout,
-                prediction_level="central_hub", initial_biases=adaptive_biases,
+                prediction_level="dual_hub", initial_biases=adaptive_biases,
                 use_context=not exp["no_context"],
                 use_image_features=not exp.get("no_image", False),
                 backbone=args.backbone

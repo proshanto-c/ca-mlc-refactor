@@ -93,7 +93,7 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
         "image_size": args.image_size,
         "patch_size": patch_size,
         "connectivity": connectivity,
-        "prediction_level": "central_hub",
+        "prediction_level": "dual_hub",
         "train_frame": train_frame
     }
     
@@ -124,7 +124,7 @@ def evaluate_model(config_dir, args, device, test_transform, test_frame, checkpo
         hidden_dim=h_dim,
         num_layers=n_layers,
         dropout=dropout,
-        prediction_level="central_hub",
+        prediction_level="dual_hub",
         use_context=not no_context,
         use_image_features=not no_image,
         backbone=backbone

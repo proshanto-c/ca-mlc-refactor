@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1                # Request 1 GPU
 #SBATCH --time=47:59:00             # Max time limit
 #SBATCH --job-name=hparam_grid
-#SBATCH --array=0-7                 # 8 array tasks across 4 cluster GPUs (24 trials total)
+#SBATCH --array=1-8                 # Array tasks 1-8 run splits 1..8 (24 larger models on cluster)
 #SBATCH --output=logs/hparam_%A_%a.out
 #SBATCH --error=logs/hparam_%A_%a.err
 
@@ -22,7 +22,7 @@ SPLIT_TOTAL=9
 PROJECT="HParam-Tuning-Multilabel-ImgOnly"
 OUTPUT_DIR="/users/sann7128/ca-mlc-refactor/data/BRSET/runs/hparam_grid_${SEED}"
 
-# 4. Run Cluster Portion of Grid Search (Trials 0 to 23 across tasks 0-7)
+# 4. Run Cluster Portion of Grid Search (Splits 1 to 8 across SLURM array tasks 1-8)
 python tune_hyperparams.py \
     --root "/users/sann7128/ca-mlc-refactor/data/BRSET" \
     --output-dir "$OUTPUT_DIR" \
@@ -30,4 +30,4 @@ python tune_hyperparams.py \
     --wandb-project "$PROJECT" \
     --grid-search \
     --split-total $SPLIT_TOTAL \
-    --split-index ${SLURM_ARRAY_TASK_ID:-0}
+    --split-index ${SLURM_ARRAY_TASK_ID:-1}
