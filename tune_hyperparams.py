@@ -137,6 +137,9 @@ def generate_trial_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
 def main() -> None:
     args = parse_args()
     
+    if args.patch_size is None:
+        args.patch_size = 16 if args.backbone == "retfound" else 32
+
     if args.split_index >= args.split_total:
         raise ValueError("--split-index must be strictly less than --split-total")
 
