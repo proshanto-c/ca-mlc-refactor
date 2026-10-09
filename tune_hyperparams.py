@@ -1,0 +1,547 @@
+import argparse
+import json
+import os
+import random
+import sys
+from itertools import product
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
+from torchvision import transforms
+
+from gnn.patientgraphmodel import PatientGraphModel
+from data_functions.BRSETGraphDataset import BRSETGraphDataset
+from utils.data_functions import create_dataloader, calculate_positive_weights
+from utils.feature_engineering import (
+    preprocess_comorbidities,
+    infer_demographic_columns,
+    fit_demographic_specs
+)
+from utils.logger import start_wandb_run
+from utils.metrics import find_optimal_thresholds
+from utils.train_functions import graph_epoch
+from utils.util_functions import select_device, set_seed, make_grad_scaler, write_json
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+# =====================================================================
+# 1. METADATA & HYPERPARAMETER SEARCH SPACE
+# =====================================================================
+
+ALL_LABELS = [
+    "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
+    "scar", "amd", "myopic_fundus"
+]
+
+GRID_SEARCH_SPACE = {
+    "hidden_dim": [128, 256, 512],
+    "num_layers": [2, 3, 4],
+    "heads": [2, 3, 4],
+    "dropout": [0.25]
+}
+
+# =====================================================================
+# 2. CLI ARGUMENT PARSER
+# =====================================================================
+
+def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Hyperparameter tuning for the Multilabel Image-Only PatientGraphModel."
+    )
+    p.add_argument("--root", type=Path, required=True, help="Dataset root directory.")
+    p.add_argument("--prepared-dir", type=Path, default=None, help="Directory containing train.csv/val.csv.")
+    
+    p.add_argument("--train-manifest", type=str, default="image_train_12.csv")
+    p.add_argument("--validation-manifest", type=str, default="image_validation_12.csv")
+    
+    p.add_argument("--output-dir", type=Path, default=None, help="Output directory for runs and checkpoints.")
+    p.add_argument("--backbone", type=str, choices=["retfound", "resnet"], default="resnet")
+    p.add_argument("--image-size", type=int, default=512)
+    p.add_argument("--patch-size", type=int, default=None, help="Defaults to 16 for retfound, 32 for resnet")
+    p.add_argument("--connectivity", default="fc", help="Patch graph connectivity (fc, 4, or 8)")
+    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    p.add_argument("--deterministic", action="store_true")
+    p.add_argument("--no-amp", action="store_true")
+    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--num-workers", type=int, default=8)
+
+    # Search strategy controls
+    p.add_argument("--grid-search", action="store_true", help="Run full grid search over the search space.")
+    p.add_argument("--num-trials", type=int, default=5, help="Number of random hyperparameter trials (ignored if --grid-search is set).")
+    
+    # Specific hyperparameter overrides (for single trial or W&B sweeps)
+    p.add_argument("--hidden-dim", type=int, choices=[128, 256, 512], default=None)
+    p.add_argument("--num-layers", type=int, choices=[2, 3, 4], default=None)
+    p.add_argument("--heads", type=int, choices=[2, 3, 4], default=None)
+    p.add_argument("--dropout", type=float, default=0.25, help="Dropout probability (fixed at 0.25 by default).")
+
+    # Splitting Arguments for SLURM Job Arrays
+    p.add_argument("--split-total", type=int, default=1, help="Total number of parallel jobs.")
+    p.add_argument("--split-index", type=int, default=0, help="0-indexed chunk to run.")
+
+    # W&B Arguments
+    p.add_argument("--wandb-project", type=str, default="Hyperparam-Tuning-Multilabel-ImgOnly")
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--wandb-run-name-prefix", type=str, default="hparam")
+    p.add_argument("--wandb-group", type=str, default="Multilabel-ImgOnly-Tuning")
+    p.add_argument("--wandb-tags", nargs="*", default=["hparam_tuning", "multilabel_img_only"])
+    p.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
+
+    return p.parse_args(args)
+
+
+# =====================================================================
+# 3. HELPER FUNCTIONS
+# =====================================================================
+
+def generate_trial_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Generates the list of hyperparameter dictionary combinations to run."""
+    # Check if single explicit hyperparameter set was provided via CLI
+    if all(v is not None for v in [args.hidden_dim, args.num_layers, args.heads]):
+        return [{
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "heads": args.heads,
+            "dropout": args.dropout
+        }]
+    
+    # Generate all 81 combinations in the grid
+    keys = list(GRID_SEARCH_SPACE.keys())
+    values = list(GRID_SEARCH_SPACE.values())
+    all_combinations = [dict(zip(keys, v)) for v in product(*values)]
+    
+    if args.grid_search:
+        return all_combinations
+    
+    # Sample uniformly at random from grid
+    rng = random.Random(args.seed)
+    sampled = rng.sample(all_combinations, min(args.num_trials, len(all_combinations)))
+    return sampled
+
+# =====================================================================
+# 4. MAIN TUNING PIPELINE
+# =====================================================================
+
+def main() -> None:
+    args = parse_args()
+    
+    if args.split_index >= args.split_total:
+        raise ValueError("--split-index must be strictly less than --split-total")
+
+    root = args.root.expanduser().resolve()
+    prepared_dir = args.prepared_dir.expanduser().resolve() if args.prepared_dir else (root / "prepared")
+    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else (root / "runs" / "hparam_tuning_multilabel_img_only")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    set_seed(args.seed, args.deterministic)
+    device = select_device(args.device)
+    amp_enabled = not args.no_amp and device.type == "cuda"
+    
+    print("===================================================================")
+    print(" HYPERPARAMETER TUNING: Multilabel Image-Only Model")
+    print("===================================================================")
+    print(f"Device: {device} | AMP: {amp_enabled} | Backbone: {args.backbone}")
+    print(f"Dataset root: {root}")
+    print(f"Output directory: {output_dir}\n")
+
+    # Load DataFrames
+    train_frame = pd.read_csv(prepared_dir / args.train_manifest)
+    val_frame = pd.read_csv(prepared_dir / args.validation_manifest)
+    
+    # Extract top 20 comorbidities
+    train_frame, top_comorb = preprocess_comorbidities(train_frame, top_k=20)
+    val_frame, _ = preprocess_comorbidities(val_frame, valid_comorb=top_comorb)
+
+    # Infer demographic columns & specs
+    demo_columns = infer_demographic_columns(train_frame, None, ALL_LABELS)
+    demo_specs = fit_demographic_specs(train_frame, demo_columns)
+
+    # Image Transforms
+    if args.backbone == "resnet":
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    else:
+        mean, std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+
+    train_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+    # Multilabel Image-Only Dataset kwargs
+    dataset_kwargs = {
+        "image_dir": root / "fundus_photos_512",
+        "target_cols": ALL_LABELS,
+        "demo_cols": demo_columns,
+        "demo_specs": demo_specs,
+        "image_size": args.image_size,
+        "patch_size": args.patch_size,
+        "connectivity": args.connectivity,
+        "prediction_level": "central_hub",
+        "train_frame": train_frame
+    }
+
+    train_dataset = BRSETGraphDataset(
+        data=train_frame,
+        validate_paths=True,
+        transform=train_transform,
+        **dataset_kwargs
+    )
+    val_dataset = BRSETGraphDataset(
+        data=val_frame,
+        validate_paths=False,
+        transform=val_transform,
+        **dataset_kwargs
+    )
+
+    train_targets = np.vstack([s["label_vector"] for s in train_dataset.samples])
+    pos_weight = calculate_positive_weights(train_targets).to(device)
+
+    pos_counts = np.maximum(train_targets.sum(axis=0), 1.0)
+    neg_counts = np.maximum(train_targets.shape[0] - pos_counts, 1.0)
+    adaptive_biases = np.log(pos_counts / neg_counts).astype(np.float32)
+
+    # Generate trials
+    all_trials = generate_trial_configs(args)
+    total_trials = len(all_trials)
+
+    # Slice for parallel array jobs
+    start_idx = total_trials * args.split_index // args.split_total
+    end_idx = total_trials * (args.split_index + 1) // args.split_total
+    my_trials = all_trials[start_idx:end_idx]
+
+    print(f"Total Trial Configurations: {total_trials}")
+    print(f"Worker Split {args.split_index + 1}/{args.split_total} - Processing trials {start_idx + 1} to {end_idx} ({len(my_trials)} trials).\n")
+
+    # Trial Execution Loop
+    for trial_idx, hparams in enumerate(my_trials, start=start_idx + 1):
+        h_dim = hparams["hidden_dim"]
+        n_layers = hparams["num_layers"]
+        heads = hparams["heads"]
+        dropout = hparams["dropout"]
+        
+        trial_name = f"trial_{trial_idx:02d}_h{h_dim}_l{n_layers}_head{heads}_drop{dropout}"
+        print("===================================================================")
+        print(f"=== [TRIAL {trial_idx}/{total_trials}] {trial_name.upper()} ===")
+        print(f"=== Params: h_dim={h_dim}, n_layers={n_layers}, heads={heads}, dropout={dropout} ===")
+        print("===================================================================\n")
+
+        run_dir = output_dir / trial_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = run_dir / "final_checkpoint.pt"
+
+        train_loader = create_dataloader(
+            dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+            seed=args.seed + trial_idx, is_graph=True
+        )
+        val_loader = create_dataloader(
+            dataset=val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+            seed=args.seed, is_graph=True
+        )
+
+        model = PatientGraphModel(
+            num_labels=len(ALL_LABELS),
+            demographic_specs=demo_specs,
+            hidden_dim=h_dim,
+            num_layers=n_layers,
+            dropout=dropout,
+            heads=heads,
+            prediction_level="central_hub",
+            initial_biases=adaptive_biases,
+            use_context=False,          # Image-Only model baseline
+            use_image_features=True,    # Image features enabled
+            backbone=args.backbone
+        ).to(device)
+
+        if os.name != 'nt':
+            try:
+                model = torch.compile(model)
+            except Exception as e:
+                print(f"Skipping torch.compile: {e}")
+        else:
+            print("Skipping torch.compile on Windows (Triton unsupported).")
+
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+        scaler = make_grad_scaler(amp_enabled)
+        
+        warmup_epochs = max(1, int(0.1 * args.epochs))
+        scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+
+        trial_config = {
+            "experiment": "multilabel_img_only",
+            "labels": ALL_LABELS,
+            "no_context": True,
+            "no_image": False,
+            "trial_idx": trial_idx,
+            "hidden_dim": h_dim,
+            "num_layers": n_layers,
+            "heads": heads,
+            "dropout": dropout,
+            "batch_size": args.batch_size,
+            "lr": args.learning_rate,
+            "seed": args.seed,
+            "demo_cols": demo_columns,
+            "demo_specs": [ds.__dict__ for ds in demo_specs],
+            "train_manifest": args.train_manifest,
+            "backbone": args.backbone,
+            "image_size": args.image_size,
+            "patch_size": args.patch_size,
+            "connectivity": args.connectivity
+        }
+        write_json(run_dir / "run_config.json", trial_config)
+
+        run_name = f"{args.wandb_run_name_prefix}-{trial_name}"
+        wandb_run = start_wandb_run(
+            project=args.wandb_project,
+            run_name=run_name,
+            config=trial_config,
+            output_dir=run_dir,
+            entity=args.wandb_entity,
+            group=args.wandb_group,
+            tags=args.wandb_tags,
+            mode=args.wandb_mode
+        )
+
+        history = []
+        best_metrics = {
+            "macro_auprc": -1.0,
+            "macro_auroc": -1.0,
+            "macro_f1_calibrated": -1.0,
+            "min_val_loss": float("inf")
+        }
+
+        for epoch in range(1, args.epochs + 1):
+            train_res = graph_epoch(
+                model=model, loader=train_loader, criterion=criterion, device=device,
+                amp_enabled=amp_enabled, label_columns=ALL_LABELS, optimizer=optimizer,
+                scaler=scaler, desc=f"[{trial_name}] E{epoch:02d} Train", threshold=args.threshold
+            )
+            scheduler.step()
+
+            val_res = graph_epoch(
+                model=model, loader=val_loader, criterion=criterion, device=device,
+                amp_enabled=amp_enabled, label_columns=ALL_LABELS, optimizer=None,
+                scaler=None, desc=f"[{trial_name}] E{epoch:02d} Val", threshold=args.threshold
+            )
+
+            best_thresholds, epoch_threshold_df = find_optimal_thresholds(
+                targets=val_res["targets"],
+                probabilities=val_res["probabilities"],
+                label_names=ALL_LABELS,
+                step=0.05
+            )
+            epoch_calibrated_f1 = epoch_threshold_df["validation_f1"].mean()
+            epoch_balanced_acc = epoch_threshold_df["validation_balanced_accuracy"].mean()
+
+            calibrated_predictions = (val_res["probabilities"] >= best_thresholds.reshape(1, -1)).astype(int)
+            epoch_calibrated_micro_f1 = f1_score(val_res["targets"], calibrated_predictions, average="micro", zero_division=0)
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": train_res["loss"],
+                "val_loss": val_res["loss"],
+                "val_macro_f1_static": val_res["summary"]["macro_f1"],
+                "val_micro_f1_static": val_res["summary"]["micro_f1"],
+                "val_macro_f1_calibrated": epoch_calibrated_f1,
+                "val_micro_f1_calibrated": epoch_calibrated_micro_f1,
+                "val_macro_auroc": val_res["summary"]["macro_auroc"],
+                "val_macro_auprc": val_res["summary"]["macro_auprc"]
+            })
+            pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
+
+            current_macro_auprc = val_res["summary"]["macro_auprc"]
+            current_macro_auroc = val_res["summary"]["macro_auroc"]
+            current_val_loss = val_res["loss"]
+
+            raw_model = getattr(model, "_orig_mod", model)
+            if args.backbone == "retfound":
+                state_dict_to_save = {k: v for k, v in raw_model.state_dict().items() if not k.startswith("cnn.")}
+            else:
+                state_dict_to_save = raw_model.state_dict()
+
+            checkpoint_data = {
+                "model_state_dict": state_dict_to_save,
+                "hyperparams": trial_config,
+                "epoch": epoch
+            }
+            torch.save(checkpoint_data, checkpoint_path)
+
+            if current_macro_auprc > best_metrics["macro_auprc"]:
+                best_metrics["macro_auprc"] = current_macro_auprc
+                torch.save(checkpoint_data, run_dir / "checkpoint_best_macro_auprc.pt")
+                if wandb_run is not None:
+                    wandb_run.summary["best_macro_auprc"] = current_macro_auprc
+                    wandb_run.summary["best_macro_auprc_epoch"] = epoch
+
+            if epoch_calibrated_f1 > best_metrics["macro_f1_calibrated"]:
+                best_metrics["macro_f1_calibrated"] = epoch_calibrated_f1
+                torch.save(checkpoint_data, run_dir / "checkpoint_best_macro_f1.pt")
+                if wandb_run is not None:
+                    wandb_run.summary["best_macro_f1_calibrated"] = epoch_calibrated_f1
+
+            if current_val_loss < best_metrics["min_val_loss"]:
+                best_metrics["min_val_loss"] = current_val_loss
+                if wandb_run is not None:
+                    wandb_run.summary["best_val_loss"] = current_val_loss
+
+            if wandb_run is not None:
+                y_true = val_res["targets"]
+                y_prob = val_res["probabilities"]
+
+                log_dict = {
+                    "epoch": epoch,
+                    "lr": scheduler.get_last_lr()[0],
+                    "train/loss": train_res["loss"],
+                    "val/loss": val_res["loss"],
+                    "val/macro_f1_uncalibrated": val_res["summary"]["macro_f1"],
+                    "val/micro_f1_uncalibrated": val_res["summary"]["micro_f1"],
+                    "val/macro_f1_calibrated": epoch_calibrated_f1,
+                    "val/micro_f1_calibrated": epoch_calibrated_micro_f1,
+                    "val/macro_auroc": val_res["summary"]["macro_auroc"],
+                    "val/macro_auprc": val_res["summary"]["macro_auprc"],
+                    "val/macro_accuracy_calibrated": epoch_threshold_df["validation_accuracy"].mean(),
+                    "val/macro_balanced_acc_calibrated": epoch_balanced_acc,
+                }
+
+                uncalibrated_preds = (y_prob >= 0.5).astype(int)
+                calibrated_preds = (y_prob >= best_thresholds.reshape(1, -1)).astype(int)
+                for idx, label in enumerate(ALL_LABELS):
+                    prefix = f"{idx+1:02d}_"
+                    try:
+                        auroc = roc_auc_score(y_true[:, idx], y_prob[:, idx])
+                    except ValueError:
+                        auroc = 0.0
+                    
+                    try:
+                        auprc = average_precision_score(y_true[:, idx], y_prob[:, idx])
+                    except ValueError:
+                        auprc = 0.0
+
+                    calib_f1_normal = f1_score(y_true[:, idx], calibrated_preds[:, idx], average="binary", zero_division=0)
+                    uncalib_f1_normal = f1_score(y_true[:, idx], uncalibrated_preds[:, idx], average="binary", zero_division=0)
+
+                    log_dict[f"val_auroc_per_class/{prefix}{label}"] = auroc
+                    log_dict[f"val_auprc_per_class/{prefix}{label}"] = auprc
+                    log_dict[f"val_calibrated_f1_per_class/{prefix}{label}"] = calib_f1_normal
+                    log_dict[f"val_uncalibrated_f1_per_class/{prefix}{label}"] = uncalib_f1_normal
+                    log_dict[f"val_optimal_threshold/{prefix}{label}"] = epoch_threshold_df.iloc[idx]["optimal_threshold"]
+
+                wandb.log(log_dict, step=epoch)
+
+        # Load best AUPRC checkpoint and rerun full evaluation on validation set
+        best_auprc_path = run_dir / "checkpoint_best_macro_auprc.pt"
+        if best_auprc_path.exists():
+            ckpt = torch.load(best_auprc_path, map_location=device)
+            raw_model = getattr(model, "_orig_mod", model)
+            raw_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            print(f"\n--> Loaded best AUPRC checkpoint from epoch {ckpt.get('epoch', 'N/A')}. Re-running validation evaluation...")
+
+        final_val_res = graph_epoch(
+            model=model, loader=val_loader, criterion=criterion, device=device,
+            amp_enabled=amp_enabled, label_columns=ALL_LABELS, optimizer=None,
+            scaler=None, desc=f"[{trial_name}] Final Best Val Eval", threshold=args.threshold
+        )
+
+        best_thresholds, final_threshold_df = find_optimal_thresholds(
+            targets=final_val_res["targets"],
+            probabilities=final_val_res["probabilities"],
+            label_names=ALL_LABELS,
+            step=0.05
+        )
+
+        final_calibrated_f1 = float(final_threshold_df["validation_f1"].mean())
+        final_calibrated_acc = float(final_threshold_df["validation_accuracy"].mean())
+        final_balanced_acc = float(final_threshold_df["validation_balanced_accuracy"].mean())
+        
+        final_calibrated_preds = (final_val_res["probabilities"] >= best_thresholds.reshape(1, -1)).astype(int)
+        final_calibrated_micro_f1 = float(f1_score(final_val_res["targets"], final_calibrated_preds, average="micro", zero_division=0))
+
+        final_eval_summary = {
+            "best_epoch": ckpt.get("epoch", None) if best_auprc_path.exists() else args.epochs,
+            "final_val_loss": float(final_val_res["loss"]),
+            "final_val_macro_auprc": float(final_val_res["summary"]["macro_auprc"]),
+            "final_val_macro_auroc": float(final_val_res["summary"]["macro_auroc"]),
+            "final_val_macro_f1_calibrated": final_calibrated_f1,
+            "final_val_micro_f1_calibrated": final_calibrated_micro_f1,
+            "final_val_macro_f1_uncalibrated": float(final_val_res["summary"]["macro_f1"]),
+            "final_val_micro_f1_uncalibrated": float(final_val_res["summary"]["micro_f1"]),
+            "final_val_accuracy_calibrated": final_calibrated_acc,
+            "final_val_balanced_acc_calibrated": final_balanced_acc,
+            "per_class": {}
+        }
+
+        y_true = final_val_res["targets"]
+        y_prob = final_val_res["probabilities"]
+        for idx, label in enumerate(ALL_LABELS):
+            prefix = f"{idx+1:02d}_"
+            try:
+                auroc = float(roc_auc_score(y_true[:, idx], y_prob[:, idx]))
+            except ValueError:
+                auroc = 0.0
+            try:
+                auprc = float(average_precision_score(y_true[:, idx], y_prob[:, idx]))
+            except ValueError:
+                auprc = 0.0
+
+            calib_f1 = float(f1_score(y_true[:, idx], final_calibrated_preds[:, idx], average="binary", zero_division=0))
+            uncalib_f1 = float(f1_score(y_true[:, idx], (y_prob[:, idx] >= 0.5).astype(int), average="binary", zero_division=0))
+            opt_thresh = float(final_threshold_df.iloc[idx]["optimal_threshold"])
+
+            final_eval_summary["per_class"][label] = {
+                "auprc": auprc,
+                "auroc": auroc,
+                "calibrated_f1": calib_f1,
+                "uncalibrated_f1": uncalib_f1,
+                "optimal_threshold": opt_thresh
+            }
+
+        write_json(run_dir / "best_val_eval_results.json", final_eval_summary)
+
+        if wandb_run is not None:
+            # Save final best-model validation scores directly to wandb.run.summary for clean hyperparameter comparison
+            wandb_run.summary["best_val/epoch"] = final_eval_summary["best_epoch"]
+            wandb_run.summary["best_val/loss"] = final_eval_summary["final_val_loss"]
+            wandb_run.summary["best_val/macro_auprc"] = final_eval_summary["final_val_macro_auprc"]
+            wandb_run.summary["best_val/macro_auroc"] = final_eval_summary["final_val_macro_auroc"]
+            wandb_run.summary["best_val/macro_f1_calibrated"] = final_eval_summary["final_val_macro_f1_calibrated"]
+            wandb_run.summary["best_val/micro_f1_calibrated"] = final_eval_summary["final_val_micro_f1_calibrated"]
+            wandb_run.summary["best_val/macro_accuracy_calibrated"] = final_eval_summary["final_val_accuracy_calibrated"]
+            wandb_run.summary["best_val/macro_balanced_acc_calibrated"] = final_eval_summary["final_val_balanced_acc_calibrated"]
+
+            for idx, label in enumerate(ALL_LABELS):
+                prefix = f"{idx+1:02d}_"
+                c_stats = final_eval_summary["per_class"][label]
+                wandb_run.summary[f"best_val_per_class/auprc_{prefix}{label}"] = c_stats["auprc"]
+                wandb_run.summary[f"best_val_per_class/auroc_{prefix}{label}"] = c_stats["auroc"]
+                wandb_run.summary[f"best_val_per_class/f1_calibrated_{prefix}{label}"] = c_stats["calibrated_f1"]
+                wandb_run.summary[f"best_val_per_class/optimal_threshold_{prefix}{label}"] = c_stats["optimal_threshold"]
+
+            wandb_run.finish()
+
+    print("\nHyperparameter tuning complete!")
+
+
+if __name__ == "__main__":
+    main()

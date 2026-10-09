@@ -21,8 +21,10 @@
 !tune_film.py
 !tune_all.py
 !evaluate_all.py
+!tune_hyperparams.py
 !submit_tuning.sh
 !submit_evaluation.sh
+!submit_hparam_tuning.sh
 
 !models/
 !models/**

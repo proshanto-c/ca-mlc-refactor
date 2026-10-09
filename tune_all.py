@@ -57,7 +57,7 @@ from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 
 ALL_LABELS = [
     "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
-    "scar", "hypertensive_retinopathy", "amd", "myopic_fundus"
+    "scar", "amd", "myopic_fundus"
 ]
 
 

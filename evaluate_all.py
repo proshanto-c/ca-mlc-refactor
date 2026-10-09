@@ -20,7 +20,7 @@ from utils.feature_engineering import preprocess_comorbidities, infer_demographi
 # Hardcoded base labels and demographics for the schema
 ALL_LABELS = [
     "increased_cup_disc", "drusens", "diabetic_retinopathy", "macular_edema",
-    "scar", "hypertensive_retinopathy", "amd", "myopic_fundus"
+    "scar", "amd", "myopic_fundus"
 ]
 
 def parse_args():
